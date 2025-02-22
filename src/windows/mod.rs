@@ -181,7 +181,7 @@ impl Verifier {
             data.dwUnionChoice = WTD_CHOICE_FILE;
             data.Anonymous.pFile = fi;
             data.dwProvFlags =
-                WTD_DISABLE_MD2_MD4 | WTD_REVOCATION_CHECK_END_CERT | WTD_NO_IE4_CHAIN_FLAG;
+                WTD_DISABLE_MD2_MD4 | WTD_REVOCATION_CHECK_END_CERT | WTD_NO_IE4_CHAIN_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
         } else if let Some(ci) = catalog_info {
             data.dwUnionChoice = WTD_CHOICE_CATALOG;
             data.Anonymous.pCatalog = ci;
