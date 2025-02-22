@@ -10,8 +10,8 @@ pub(crate) use context::Context;
 
 struct CleanupContext {
     h_file: HANDLE,
-    h_cat_admin: HANDLE,
-    h_cat_info: HANDLE,
+    h_cat_admin: isize,
+    h_cat_info: isize,
 }
 
 impl CleanupContext {
@@ -26,7 +26,7 @@ impl CleanupContext {
 
 impl Drop for CleanupContext {
     fn drop(&mut self) {
-        if self.h_file != 0 {
+        if self.h_file != std::ptr::null_mut() {
             unsafe { CloseHandle(self.h_file) };
         }
 
@@ -76,33 +76,33 @@ impl Verifier {
     }
 
     unsafe fn verify_catalog_signed(&self) -> Result<Context, Error> {
-        let h_file = CreateFileW(
+        let h_file = unsafe { CreateFileW(
             self.0.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ,
             std::ptr::null_mut(),
             OPEN_EXISTING,
             0,
-            0,
-        );
+            std::ptr::null_mut(),
+        ) };
 
         if h_file == INVALID_HANDLE_VALUE {
-            let err = GetLastError() as i32;
+            let err = unsafe { GetLastError() } as i32;
             return Err(Error::OsError(err));
         }
 
         let mut ctx = CleanupContext::new(h_file);
 
-        let mut h_cat_admin: HANDLE = 0;
-        let result = CryptCATAdminAcquireContext2(
+        let mut h_cat_admin: isize = 0;
+        let result = unsafe { CryptCATAdminAcquireContext2(
             &mut h_cat_admin,
             std::ptr::null(),
             BCRYPT_SHA256_ALGORITHM,
             std::ptr::null(),
             0,
-        );
+        ) };
         if result == 0 {
-            let err = GetLastError() as i32;
+            let err = unsafe { GetLastError() } as i32;
             return Err(Error::OsError(err));
         }
 
@@ -110,37 +110,37 @@ impl Verifier {
 
         let mut hash_size: DWORD = 32;
         let mut hash_buffer: Vec<BYTE> = vec![0; hash_size as usize];
-        let result = CryptCATAdminCalcHashFromFileHandle2(
+        let result = unsafe { CryptCATAdminCalcHashFromFileHandle2(
             h_cat_admin,
             h_file,
             &mut hash_size,
             hash_buffer.as_mut_ptr(),
             0,
-        );
+        ) };
         if result == 0 {
-            let err = GetLastError() as i32;
+            let err = unsafe { GetLastError() } as i32;
             return Err(Error::OsError(err));
         }
 
-        let h_cat_info = CryptCATAdminEnumCatalogFromHash(
+        let h_cat_info = unsafe { CryptCATAdminEnumCatalogFromHash(
             h_cat_admin,
             hash_buffer.as_ptr(),
             hash_size,
             0,
             std::ptr::null_mut(),
-        );
+        ) };
         if h_cat_info == 0 {
             return Err(Error::Unsigned);
         }
 
         ctx.h_cat_info = h_cat_info;
 
-        let mut ci: CATALOG_INFO = std::mem::zeroed();
+        let mut ci: CATALOG_INFO = unsafe { std::mem::zeroed() };
         ci.cbStruct = std::mem::size_of::<CATALOG_INFO>() as u32;
 
-        let result = CryptCATCatalogInfoFromContext(h_cat_info, &mut ci, 0);
+        let result = unsafe { CryptCATCatalogInfoFromContext(h_cat_info, &mut ci, 0) };
         if result == 0 {
-            let err = GetLastError() as i32;
+            let err = unsafe { GetLastError() } as i32;
             return Err(Error::OsError(err));
         }
 
@@ -152,13 +152,13 @@ impl Verifier {
         let mut hash: Vec<u16> = hash_str.encode_utf16().collect();
         hash.push(0); // Make sure hash is null terminated
 
-        let mut wci: WINTRUST_CATALOG_INFO = std::mem::zeroed();
+        let mut wci: WINTRUST_CATALOG_INFO = unsafe { std::mem::zeroed() };
         wci.cbStruct = std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32;
         wci.pcwszCatalogFilePath = ci.wszCatalogFile.as_ptr();
         wci.pcwszMemberFilePath = self.0.as_ptr();
         wci.pcwszMemberTag = hash.as_ptr();
 
-        match self.verify_internal(None, Some(&mut wci)) {
+        match unsafe { self.verify_internal(None, Some(&mut wci)) } {
             Ok(context) => Ok(context),
             Err(err) => Err(Error::OsError(err as i32)),
         }
@@ -170,7 +170,7 @@ impl Verifier {
         catalog_info: Option<*mut WINTRUST_CATALOG_INFO>,
     ) -> Result<Context, WIN32_ERROR> {
         // Initialize the WINTRUST_DATA structure
-        let mut data: WINTRUST_DATA = std::mem::zeroed();
+        let mut data: WINTRUST_DATA = unsafe { std::mem::zeroed() };
         data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
         data.dwUIChoice = WTD_UI_NONE;
         data.fdwRevocationChecks = WTD_REVOKE_NONE;
@@ -193,16 +193,15 @@ impl Verifier {
         let mut guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 
         // Verify that the signature is actually valid
-        match WinVerifyTrust(
+        match unsafe { WinVerifyTrust(
             INVALID_HANDLE_VALUE as _,
             &mut guid,
             &mut data as *mut _ as _,
-        ) {
+        ) } {
             0 => {}
             _ => {
-                let err = std::io::Error::last_os_error();
                 let _ = Context::new(data.hWVTStateData); // So close gets called on the data
-                return Err(GetLastError());
+                return Err(unsafe { GetLastError() });
             }
         }
 
@@ -216,7 +215,7 @@ fn get_process_path(proc_id: u32) -> Result<String, Error> {
 
     unsafe {
         let proc_handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc_id) {
-            handle if handle == 0 => return Err(Error::OsError(GetLastError() as i32)),
+            handle if handle == std::ptr::null_mut() => return Err(Error::OsError(GetLastError() as i32)),
             handle => handle,
         };
 
