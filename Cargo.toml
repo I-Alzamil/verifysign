@@ -7,7 +7,7 @@ authors = ["Vlad Krasnov <vlad@cloudflare.com>","I-Alzamil <easysekker@gmail.com
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/I-Alzamil/verifysign"
-keywords = ["macos", "windows", "code", "signature", "authenticode", "verify"]
+keywords = ["macos", "windows", "code", "signature", "authenticode"]
 
 [dependencies]
 sha2 = "0.10"
