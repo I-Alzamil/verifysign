@@ -1,7 +1,7 @@
 [package]
 # Forked from codesign-verify-rs in 22/02/2025 credit to Vlad Krasnov <vlad@cloudflare.com>
 name = "verifysign"
-version = "0.1.4"
+version = "0.1.5"
 description = "A rust cargo used to verify digital code signature on files."
 authors = ["Vlad Krasnov <vlad@cloudflare.com>","I-Alzamil <easysekker@gmail.com>"]
 edition = "2024"
