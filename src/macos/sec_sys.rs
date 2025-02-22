@@ -21,7 +21,7 @@ pub type SecCodeRef = *const __SecCode;
 pub type SecStaticCodeRef = *const __SecStaticCode;
 pub type SecRequirementRef = *const __SecRequirement;
 
-extern "C" {
+unsafe extern "C" {
     pub fn SecCertificateGetTypeID() -> CFTypeID;
     pub fn SecCodeGetTypeID() -> CFTypeID;
     pub fn SecStaticCodeGetTypeID() -> CFTypeID;
@@ -62,7 +62,7 @@ pub enum SecCSFlags {
     any(target_os = "macos", target_os = "ios"),
     link(name = "Security", kind = "framework")
 )]
-extern "C" {
+unsafe extern "C" {
     pub fn SecCodeCopyGuestWithAttributes(
         host: SecCodeRef,
         attributes: CFDictionaryRef,
