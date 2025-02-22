@@ -6,7 +6,7 @@ description = "A rust cargo used to verify digital code signature on files."
 authors = ["Vlad Krasnov <vlad@cloudflare.com>","I-Alzamil <easysekker@gmail.com>"]
 edition = "2024"
 license = "BSD-3-Clause"
-repository = "https://github.com/vkrasnov/codesign-verify-rs"
+repository = "https://github.com/I-Alzamil/verifysign"
 keywords = ["macos", "windows", "code", "signature", "authenticode", "verify"]
 
 [dependencies]
