@@ -1,7 +1,7 @@
 [package]
 # Forked from codesign-verify-rs in 22/02/2025 credit to Vlad Krasnov <vlad@cloudflare.com>
 name = "verifysign"
-version = "0.1.5"
+version = "0.1.6"
 description = "A rust cargo used to verify digital code signature on files."
 authors = ["Vlad Krasnov <vlad@cloudflare.com>","I-Alzamil <easysekker@gmail.com>"]
 edition = "2024"
@@ -29,4 +29,4 @@ windows-sys = { version = "0.59.0", features = [
                                     ] }
 
 [package.metadata.docs.rs]
-default-target = "x86_64-apple-darwin"
+default-target = "x86_64-pc-windows-msvc"
