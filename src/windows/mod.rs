@@ -200,6 +200,7 @@ impl Verifier {
         ) {
             0 => {}
             _ => {
+                let err = std::io::Error::last_os_error();
                 let _ = Context::new(data.hWVTStateData); // So close gets called on the data
                 return Err(GetLastError());
             }
