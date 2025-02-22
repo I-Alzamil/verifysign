@@ -168,12 +168,12 @@ mod tests {
 
         assert_eq!(
             ctx.sha1_thumbprint(),
-            "58fd671e2d4d200ce92d6e799ec70df96e6d2664"
+            "aeb9b61e47d91c42fff213992b7810a3d562fb12"
         );
 
         assert_eq!(
             ctx.serial().as_deref(),
-            Some("330000041331bc198807a90774000000000413")
+            Some("33000004a7043ee422c834fafc0000000004a7")
         );
     }
 
