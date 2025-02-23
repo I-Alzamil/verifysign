@@ -1,13 +1,6 @@
 use super::wintrust_sys::*;
 use crate::Name;
 
-#[allow(non_camel_case_types)]
-#[repr(C)]
-struct CRYPT_PROVIDER_CERT_HDR {
-    cbStruct: DWORD,
-    pCert: PCCERT_CONTEXT,
-}
-
 pub(crate) struct Context {
     data: HANDLE,
     leaf_cert_ptr: PCCERT_CONTEXT,
@@ -25,7 +18,7 @@ fn close_data(handle: HANDLE) {
     data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
     data.dwUIChoice = WTD_UI_NONE;
     data.fdwRevocationChecks = WTD_REVOKE_NONE;
-    data.dwUnionChoice = 0;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
     data.dwStateAction = WTD_STATEACTION_CLOSE;
     data.dwUIContext = WTD_UICONTEXT_EXECUTE;
     data.hWVTStateData = handle;
@@ -34,9 +27,9 @@ fn close_data(handle: HANDLE) {
 
     unsafe {
         WinVerifyTrust(
-            INVALID_HANDLE_VALUE as _,
+            INVALID_HANDLE_VALUE,
             &mut guid,
-            &mut data as *mut _ as _,
+            &mut data as *mut _ as *mut std::ffi::c_void,
         )
     };
 }
@@ -61,7 +54,7 @@ impl Context {
 
             let crypt_prov_cert = match WTHelperGetProvCertFromChain(crypt_prov_sgnr, 0) {
                 cert if cert.is_null() => return Err(TRUST_E_NO_SIGNER_CERT as u32),
-                cert => cert as *const CRYPT_PROVIDER_CERT_HDR,
+                cert => cert,
             };
 
             ret.leaf_cert_ptr = crypt_prov_cert.as_ref().unwrap().pCert as PCCERT_CONTEXT;
@@ -70,9 +63,8 @@ impl Context {
         Ok(ret)
     }
 
-    fn get_oid_name(&self, issuer: bool, oid: &str) -> Option<String> {
+    fn get_oid_name(&self, issuer: bool, oid: windows_sys::core::PCSTR) -> Option<String> {
         use std::os::windows::ffi::OsStringExt;
-        let key = std::ffi::CString::new(oid).unwrap();
         let flag = if issuer { CERT_NAME_ISSUER_FLAG } else { 0 };
 
         // Determine string size:
@@ -81,7 +73,7 @@ impl Context {
                 self.leaf_cert_ptr,
                 CERT_NAME_ATTR_TYPE,
                 flag,
-                key.as_bytes_with_nul().as_ptr() as _,
+                oid as *mut std::ffi::c_void,
                 std::ptr::null_mut(),
                 0,
             )
@@ -98,7 +90,7 @@ impl Context {
                 self.leaf_cert_ptr,
                 CERT_NAME_ATTR_TYPE,
                 flag,
-                key.as_ptr() as _,
+                oid as *mut std::ffi::c_void,
                 buf.as_mut_ptr(),
                 buf.len() as _,
             )
@@ -134,47 +126,75 @@ impl Context {
 
     pub fn subject_name(&self) -> Name {
         Name {
-            common_name: self.get_oid_name(false, "2.5.4.3"),
-            organization: self.get_oid_name(false, "2.5.4.10"),
-            organization_unit: self.get_oid_name(false, "2.5.4.11"),
-            country: self.get_oid_name(false, "2.5.4.6"),
+            common_name: self.get_oid_name(false, szOID_COMMON_NAME),
+            organization: self.get_oid_name(false, szOID_ORGANIZATION_NAME),
+            organization_unit: self.get_oid_name(false, szOID_ORGANIZATIONAL_UNIT_NAME),
+            country: self.get_oid_name(false, szOID_COUNTRY_NAME),
         }
     }
 
     pub fn issuer_name(&self) -> Name {
         Name {
-            common_name: self.get_oid_name(true, "2.5.4.3"),
-            organization: self.get_oid_name(true, "2.5.4.10"),
-            organization_unit: self.get_oid_name(true, "2.5.4.11"),
-            country: self.get_oid_name(true, "2.5.4.6"),
+            common_name: self.get_oid_name(true, szOID_COMMON_NAME),
+            organization: self.get_oid_name(true, szOID_ORGANIZATION_NAME),
+            organization_unit: self.get_oid_name(true, szOID_ORGANIZATIONAL_UNIT_NAME),
+            country: self.get_oid_name(true, szOID_COUNTRY_NAME),
         }
     }
 
     pub fn sha1_thumbprint(&self) -> String {
-        let cert_ref = unsafe { self.leaf_cert_ptr.as_ref().unwrap() };
-        let cert_data = unsafe {
-            std::slice::from_raw_parts(cert_ref.pbCertEncoded, cert_ref.cbCertEncoded as _)
-        };
+        let mut len: u32 = 0;
+       
+        unsafe { 
+            CertGetCertificateContextProperty(
+                self.leaf_cert_ptr,
+                CERT_SHA1_HASH_PROP_ID,
+                std::ptr::null_mut(),
+                &mut len
+            );
+        }
 
-        use sha1::Digest;
-        let hash = sha1::Sha1::digest(cert_data);
+        let mut buf: Vec<u8> = vec![0;len as usize];
 
-        hash.as_slice()
+        unsafe { 
+            CertGetCertificateContextProperty(
+                self.leaf_cert_ptr,
+                CERT_SHA1_HASH_PROP_ID,
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut len
+            );
+        }
+
+        buf.as_slice()
             .iter()
-            .fold(String::new(), |s, byte| s + &format!("{:02x}", byte))
+            .fold(String::new(), |full_hash, hash_chunk| full_hash + &format!("{:02x}", hash_chunk))
     }
 
     pub fn sha256_thumbprint(&self) -> String {
-        let cert_ref = unsafe { self.leaf_cert_ptr.as_ref().unwrap() };
-        let cert_data = unsafe {
-            std::slice::from_raw_parts(cert_ref.pbCertEncoded, cert_ref.cbCertEncoded as _)
-        };
+        let mut len: u32 = 0;
+        
+        unsafe { 
+            CertGetCertificateContextProperty(
+                self.leaf_cert_ptr,
+                CERT_SHA256_HASH_PROP_ID,
+                std::ptr::null_mut(),
+                &mut len
+            );
+        }
 
-        use sha2::Digest;
-        let hash = sha2::Sha256::digest(cert_data);
+        let mut buf: Vec<u8> = vec![0;len as usize];
 
-        hash.as_slice()
+        unsafe { 
+            CertGetCertificateContextProperty(
+                self.leaf_cert_ptr,
+                CERT_SHA256_HASH_PROP_ID,
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut len
+            );
+        }
+
+        buf.as_slice()
             .iter()
-            .fold(String::new(), |s, byte| s + &format!("{:02x}", byte))
+            .fold(String::new(), |full_hash, hash_chunk| full_hash + &format!("{:02x}", hash_chunk))
     }
 }
