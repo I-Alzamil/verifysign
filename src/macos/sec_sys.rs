@@ -22,10 +22,10 @@ pub type SecStaticCodeRef = *const __SecStaticCode;
 pub type SecRequirementRef = *const __SecRequirement;
 
 unsafe extern "C" {
-    pub fn SecCertificateGetTypeID() -> CFTypeID;
-    pub fn SecCodeGetTypeID() -> CFTypeID;
-    pub fn SecStaticCodeGetTypeID() -> CFTypeID;
-    pub fn SecRequirementGetTypeID() -> CFTypeID;
+    pub unsafe fn SecCertificateGetTypeID() -> CFTypeID;
+    pub unsafe fn SecCodeGetTypeID() -> CFTypeID;
+    pub unsafe fn SecStaticCodeGetTypeID() -> CFTypeID;
+    pub unsafe fn SecRequirementGetTypeID() -> CFTypeID;
 }
 
 declare_TCFType!(SecCertificate, SecCertificateRef);
@@ -63,69 +63,67 @@ pub enum SecCSFlags {
     link(name = "Security", kind = "framework")
 )]
 unsafe extern "C" {
-    pub fn SecCodeCopyGuestWithAttributes(
+    pub unsafe fn SecCodeCopyGuestWithAttributes(
         host: SecCodeRef,
         attributes: CFDictionaryRef,
         flags: SecCSFlags,
         guest: Option<&mut SecCodeRef>,
     ) -> OSStatus;
 
-    pub fn SecStaticCodeCreateWithPath(
+    pub unsafe fn SecStaticCodeCreateWithPath(
         path: CFURLRef,
         flags: SecCSFlags,
         static_code: Option<&mut SecStaticCodeRef>,
     ) -> OSStatus;
 
-    pub fn SecCodeCheckValidityWithErrors(
+    pub unsafe fn SecCodeCheckValidityWithErrors(
         code: SecCodeRef,
         flags: SecCSFlags,
         requirement: SecRequirementRef,
         errors: Option<&mut CFErrorRef>,
     ) -> OSStatus;
 
-    pub fn SecStaticCodeCheckValidityWithErrors(
+    pub unsafe fn SecStaticCodeCheckValidityWithErrors(
         code: SecStaticCodeRef,
         flags: SecCSFlags,
         requirement: SecRequirementRef,
         errors: Option<&mut CFErrorRef>,
     ) -> OSStatus;
 
-    pub fn SecRequirementCreateWithStringAndErrors(
+    pub unsafe fn SecRequirementCreateWithStringAndErrors(
         text: CFStringRef,
         flags: SecCSFlags,
         errors: Option<&mut CFErrorRef>,
         requirement: Option<&mut SecRequirementRef>,
     ) -> OSStatus;
 
-    pub fn SecCodeCopySigningInformation(
+    pub unsafe fn SecCodeCopySigningInformation(
         code: SecStaticCodeRef,
         flags: SecCSFlags,
         information: Option<&mut CFDictionaryRef>,
     ) -> OSStatus;
 
-    pub fn CFErrorCopyUserInfo(err: CFErrorRef) -> CFDictionaryRef;
+    pub unsafe fn SecCertificateCopyData(certificate: SecCertificateRef) -> CFDataRef;
 
-    pub fn SecCertificateCopyData(certificate: SecCertificateRef) -> CFDataRef;
-
-    pub fn SecCertificateCopyValues(
+    pub unsafe fn SecCertificateCopyValues(
         certificate: SecCertificateRef,
         keys: CFArrayRef,
         errors: Option<&mut CFErrorRef>,
     ) -> CFDictionaryRef;
 
-    pub static kSecGuestAttributePid: CFStringRef;
-    pub static kSecCodeInfoCertificates: CFStringRef;
+    pub unsafe static kSecGuestAttributePid: CFStringRef;
+    pub unsafe static kSecCodeInfoCertificates: CFStringRef;
 
-    pub static kSecPropertyKeyValue: CFStringRef;
-    pub static kSecPropertyKeyLabel: CFStringRef;
-    pub static kSecPropertyKeyType: CFStringRef;
+    pub unsafe static kSecPropertyKeyValue: CFStringRef;
+    pub unsafe static kSecPropertyKeyLabel: CFStringRef;
+    pub unsafe static kSecPropertyKeyType: CFStringRef;
 
-    pub static kSecOIDX509V1SubjectName: CFStringRef;
-    pub static kSecOIDX509V1IssuerName: CFStringRef;
-    pub static kSecOIDX509V1SerialNumber: CFStringRef;
+    pub unsafe static kSecOIDX509V1SubjectName: CFStringRef;
+    pub unsafe static kSecOIDX509V1IssuerName: CFStringRef;
+    pub unsafe static kSecOIDX509V1SerialNumber: CFStringRef;
 
-    pub static kSecOIDCountryName: CFStringRef;
-    pub static kSecOIDCommonName: CFStringRef;
-    pub static kSecOIDOrganizationalUnitName: CFStringRef;
-    pub static kSecOIDOrganizationName: CFStringRef;
+    pub unsafe static kSecOIDCountryName: CFStringRef;
+    pub unsafe static kSecOIDCommonName: CFStringRef;
+    pub unsafe static kSecOIDOrganizationalUnitName: CFStringRef;
+    pub unsafe static kSecOIDOrganizationName: CFStringRef;
 }
