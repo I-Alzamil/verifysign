@@ -109,25 +109,25 @@ impl Context {
         for value in values.iter() {
             // Iterate over the values until we find the correct label
             let subdict: CFDictionary<CFString, CFType> =
-                CFDictionary::wrap_under_get_rule(*value as _);
+                unsafe { CFDictionary::wrap_under_get_rule(*value as _) };
 
             let label_key: CFString = SecProperty::Label.into();
             let value_key: CFString = SecProperty::Value.into();
 
-            let label = CFString::wrap_under_get_rule(subdict.find(label_key)?.as_CFTypeRef() as _);
+            let label = unsafe { CFString::wrap_under_get_rule(subdict.find(label_key)?.as_CFTypeRef() as _) };
 
             if label == search_label {
                 return subdict
                     .find(value_key)
-                    .map(|r| CFType::wrap_under_get_rule(r.as_CFTypeRef()));
+                    .map(|r| unsafe { CFType::wrap_under_get_rule(r.as_CFTypeRef()) });
             }
         }
         None
     }
 
     unsafe fn get_string<T: Into<CFString>>(values: &CFArray, concrete_label: T) -> Option<String> {
-        Self::get_sub_value(values, concrete_label)
-            .map(|t| CFString::wrap_under_get_rule(t.as_CFTypeRef() as _).to_string())
+        unsafe {Self::get_sub_value(values, concrete_label)
+            .map(|t| CFString::wrap_under_get_rule(t.as_CFTypeRef() as _).to_string())}
     }
 
     fn name_for_field(&self, field: SecOID) -> Name {
