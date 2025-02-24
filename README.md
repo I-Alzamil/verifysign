@@ -1,13 +1,25 @@
 # verifysign
+A Rust library providing a verifier for code signing in Windows and macOS.
 
-A rust cargo used to verify digital code signature on files.
+## Description
+The `verifysign` crate is an easy-to-use Rust library designed to verify the presence and authenticity of digital signatures on files. It provides developers with the tools to inspect and extract detailed signer information from digitally signed files, making it ideal for applications that require secure file validation, integrity checks, and certificate-based authentication.
 
-This cargo aims to provide a way for developers to check if a file is signed or not. As well as give them the ability to query the signer information.
+## Key Features
+- **Signature Verification:** Verify whether a file has a valid digital signature.
+- **Signer Information Extraction:** Query and retrieve detailed information about the signer, including:
+  - **Signer Name:** The name of the individual or organization that signed the file.
+  - **Issuer Name:** The entity that issued the signer's certificate.
+  - **Serial Number:** The unique identifier of the signer's certificate.
+  - **Thumbprint:** The cryptographic hash of the certificate in both SHA1 and SHA256.
+- **Cross-Platform Support:** Works seamlessly in both Windows and macOS.
 
-## How to use
+## Use Cases
+- Verify the authenticity of downloaded files or software packages.
+- Ensure the integrity of critical documents in secure workflows.
+- Implement certificate-based authentication in enterprise applications.
+- Audit and log signer information for compliance purposes.
 
-The following code demonstrate how you could use this crate to help with verifying the signature:
-
+## Example Usage
 ```rust
 fn main() {
     #[cfg(target_os = "windows")]
@@ -45,6 +57,15 @@ fn main() {
 }
 ```
 
-## Credit
+## Installation
+Add the crate to your `Cargo.toml`:
+```toml
+[dependencies]
+verifysign = "*"
+```
 
-This project was forked from (codesign-verify-rs)[https://github.com/vkrasnov/codesign-verify-rs] in 22/02/2025 credit to Vlad Krasnov.
+## License
+This crate is distributed under the BSD 3-Clause License, making it free to use, modify, and distribute in both open-source and commercial projects. Whether you're building secure software, auditing tools, or compliance systems, `verifysign` provides the functionality you need to ensure file integrity and authenticity with ease.
+
+### Credit
+This project was forked from [codesign-verify-rs](https://github.com/vkrasnov/codesign-verify-rs) in 22/02/2025 credit to Vlad Krasnov.
