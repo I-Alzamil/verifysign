@@ -3,7 +3,7 @@ use crate::Name;
 
 pub(crate) struct Context {
     data: HANDLE,
-    leaf_cert_ptr: PCCERT_CONTEXT,
+    leaf_cert_ptr: *const CERT_CONTEXT,
 }
 
 impl Drop for Context {
@@ -57,7 +57,7 @@ impl Context {
                 cert => cert,
             };
 
-            ret.leaf_cert_ptr = crypt_prov_cert.as_ref().unwrap().pCert as PCCERT_CONTEXT;
+            ret.leaf_cert_ptr = crypt_prov_cert.as_ref().unwrap().pCert;
         }
 
         Ok(ret)

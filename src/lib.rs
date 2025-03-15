@@ -61,7 +61,7 @@ impl CodeSignVerifier {
     /// Create a verifier for a running application by PID.
     /// On Windows it will get the full path to the running application first.
     /// This can be used for e.g. verifying the app on the other end of a pipe.
-    pub fn for_pid(pid: i32) -> Result<Self, Error> {
+    pub fn for_pid(pid: u32) -> Result<Self, Error> {
         Verifier::for_pid(pid).map(|v| CodeSignVerifier(v))
     }
 
