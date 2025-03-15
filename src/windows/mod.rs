@@ -1,4 +1,3 @@
-#[allow(non_snake_case)]
 mod context;
 mod wintrust_sys;
 
@@ -51,8 +50,8 @@ impl Verifier {
     }
 
     // Extract the path of a pid, then call for file
-    pub fn for_pid(pid: i32) -> Result<Self, Error> {
-        let path = get_process_path(pid as _)?;
+    pub fn for_pid(pid: u32) -> Result<Self, Error> {
+        let path = get_process_path(pid)?;
         Self::for_file(path)
     }
 
@@ -108,8 +107,8 @@ impl Verifier {
 
         ctx.h_cat_admin = h_cat_admin;
 
-        let mut hash_size: DWORD = 32;
-        let mut hash_buffer: Vec<BYTE> = vec![0; hash_size as usize];
+        let mut hash_size: u32 = 32;
+        let mut hash_buffer: Vec<u8> = vec![0; hash_size as usize];
         let result = unsafe { CryptCATAdminCalcHashFromFileHandle2(
             h_cat_admin,
             h_file,
