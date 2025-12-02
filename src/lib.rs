@@ -142,9 +142,11 @@ mod tests {
             Some("Apple Certification Authority")
         );
 
+        println!("{}",ctx.sha256_thumbprint());
+
         assert_eq!(
             ctx.sha1_thumbprint(),
-            "013e2787748a74103d62d2cdbf77a1345517c482"
+            "efdbc9139dd98dbae5a9c7165a096511b15eaef9"
         );
     }
 

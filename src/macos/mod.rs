@@ -16,13 +16,13 @@ enum SecCodeKind {
 
 impl Verifier {
     /// Retrieve the code object for the process with the given pid
-    pub fn for_pid(pid: i32) -> Result<Self, Error> {
+    pub fn for_pid(pid: u32) -> Result<Self, Error> {
         let mut sec: SecCodeRef = std::ptr::null_mut();
 
         let attributes = unsafe {
             CFDictionary::from_CFType_pairs(&[(
                 CFString::wrap_under_get_rule(kSecGuestAttributePid),
-                CFNumber::from(pid),
+                CFNumber::from(pid as i32),
             )])
         };
 
