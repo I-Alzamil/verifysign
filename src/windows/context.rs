@@ -146,59 +146,40 @@ impl Context {
         }
     }
 
-    pub fn sha1_thumbprint(&self) -> String {
+    fn hash_property(&self, prop_id: u32) -> String {
         let mut len: u32 = 0;
-       
-        unsafe { 
+
+        let ok = unsafe {
             CertGetCertificateContextProperty(
                 self.leaf_cert_ptr,
-                CERT_SHA1_HASH_PROP_ID,
+                prop_id,
                 std::ptr::null_mut(),
-                &mut len
-            );
-        }
+                &mut len,
+            )
+        };
+        assert_ne!(ok, 0, "CertGetCertificateContextProperty failed to size hash property {prop_id}");
 
-        let mut buf: Vec<u8> = vec![0;len as usize];
+        let mut buf: Vec<u8> = vec![0; len as usize];
 
-        unsafe { 
+        let ok = unsafe {
             CertGetCertificateContextProperty(
                 self.leaf_cert_ptr,
-                CERT_SHA1_HASH_PROP_ID,
+                prop_id,
                 buf.as_mut_ptr() as *mut std::ffi::c_void,
-                &mut len
-            );
-        }
+                &mut len,
+            )
+        };
+        assert_ne!(ok, 0, "CertGetCertificateContextProperty failed to read hash property {prop_id}");
 
-        buf.as_slice()
-            .iter()
-            .fold(String::new(), |full_hash, hash_chunk| full_hash + &format!("{:02x}", hash_chunk))
+        buf.iter()
+            .fold(String::new(), |full_hash, byte| full_hash + &format!("{:02x}", byte))
+    }
+
+    pub fn sha1_thumbprint(&self) -> String {
+        self.hash_property(CERT_SHA1_HASH_PROP_ID)
     }
 
     pub fn sha256_thumbprint(&self) -> String {
-        let mut len: u32 = 0;
-        
-        unsafe { 
-            CertGetCertificateContextProperty(
-                self.leaf_cert_ptr,
-                CERT_SHA256_HASH_PROP_ID,
-                std::ptr::null_mut(),
-                &mut len
-            );
-        }
-
-        let mut buf: Vec<u8> = vec![0;len as usize];
-
-        unsafe { 
-            CertGetCertificateContextProperty(
-                self.leaf_cert_ptr,
-                CERT_SHA256_HASH_PROP_ID,
-                buf.as_mut_ptr() as *mut std::ffi::c_void,
-                &mut len
-            );
-        }
-
-        buf.as_slice()
-            .iter()
-            .fold(String::new(), |full_hash, hash_chunk| full_hash + &format!("{:02x}", hash_chunk))
+        self.hash_property(CERT_SHA256_HASH_PROP_ID)
     }
 }

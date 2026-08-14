@@ -47,8 +47,6 @@ pub enum Error {
     LeafCertNotFound, // Unable to fetch certificate information
     #[cfg(target_os = "macos")]
     CFError(String),
-    #[cfg(windows)]
-    IoError(std::io::Error),
 }
 
 impl CodeSignVerifier {

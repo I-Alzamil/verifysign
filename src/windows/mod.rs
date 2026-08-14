@@ -25,7 +25,7 @@ impl CleanupContext {
 
 impl Drop for CleanupContext {
     fn drop(&mut self) {
-        if self.h_file != std::ptr::null_mut() {
+        if !self.h_file.is_null() {
             unsafe { CloseHandle(self.h_file) };
         }
 
