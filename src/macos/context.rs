@@ -161,11 +161,17 @@ impl Context {
             CFData::wrap_under_create_rule(SecCertificateCopyData(self.cert.as_concrete_TypeRef()))
         };
 
-        use sha1::Digest;
-        let hash = sha1::Sha1::digest(cert_data.bytes());
+        let bytes = cert_data.bytes();
+        let mut hash = [0u8; CC_SHA1_DIGEST_LENGTH];
+        unsafe {
+            CC_SHA1(
+                bytes.as_ptr() as *const _,
+                bytes.len() as CC_LONG,
+                hash.as_mut_ptr(),
+            );
+        }
 
-        hash.as_slice()
-            .iter()
+        hash.iter()
             .fold(String::new(), |s, byte| s + &format!("{:02x}", byte))
     }
 
@@ -174,11 +180,17 @@ impl Context {
             CFData::wrap_under_create_rule(SecCertificateCopyData(self.cert.as_concrete_TypeRef()))
         };
 
-        use sha2::Digest;
-        let hash = sha2::Sha256::digest(cert_data.bytes());
+        let bytes = cert_data.bytes();
+        let mut hash = [0u8; CC_SHA256_DIGEST_LENGTH];
+        unsafe {
+            CC_SHA256(
+                bytes.as_ptr() as *const _,
+                bytes.len() as CC_LONG,
+                hash.as_mut_ptr(),
+            );
+        }
 
-        hash.as_slice()
-            .iter()
+        hash.iter()
             .fold(String::new(), |s, byte| s + &format!("{:02x}", byte))
     }
 }

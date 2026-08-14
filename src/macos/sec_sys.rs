@@ -127,3 +127,15 @@ unsafe extern "C" {
     pub unsafe static kSecOIDOrganizationalUnitName: CFStringRef;
     pub unsafe static kSecOIDOrganizationName: CFStringRef;
 }
+
+#[allow(non_camel_case_types)]
+pub type CC_LONG = u32;
+
+pub const CC_SHA1_DIGEST_LENGTH: usize = 20;
+pub const CC_SHA256_DIGEST_LENGTH: usize = 32;
+
+// Part of libSystem, which is always linked on macOS/iOS; no explicit framework link needed.
+unsafe extern "C" {
+    pub unsafe fn CC_SHA1(data: *const std::ffi::c_void, len: CC_LONG, md: *mut u8) -> *mut u8;
+    pub unsafe fn CC_SHA256(data: *const std::ffi::c_void, len: CC_LONG, md: *mut u8) -> *mut u8;
+}
