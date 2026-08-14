@@ -115,7 +115,7 @@ impl Verifier {
                 }
                 status => {
                     if !err.is_null() {
-                        return Err(err.into());
+                        return Err(Error::from_cferror(err));
                     } else {
                         return Err(Error::OsError(status));
                     }
@@ -153,7 +153,7 @@ impl Verifier {
             }
             status => {
                 if !err.is_null() {
-                    Err(err.into())
+                    Err(unsafe { Error::from_cferror(err) })
                 } else {
                     Err(Error::OsError(status))
                 }
@@ -162,16 +162,18 @@ impl Verifier {
     }
 }
 
-impl From<CFErrorRef> for Error {
-    fn from(err: CFErrorRef) -> Self {
-        if err.is_null() {
-            panic!()
-        }
+impl Error {
+    /// Converts a non-null, owned `CFErrorRef` into an `Error`.
+    ///
+    /// # Safety
+    ///
+    /// `err` must be non-null and the caller must own the reference (e.g. it came from a
+    /// `CF_RETURNS_RETAINED` out-param), since this adopts it without an extra retain.
+    unsafe fn from_cferror(err: CFErrorRef) -> Self {
+        debug_assert!(!err.is_null());
         unsafe {
-            // errors out-params on the Sec* APIs are CF_RETURNS_RETAINED: we own this
-            // reference already, so adopt it instead of retaining an extra one.
             let err = CFError::wrap_under_create_rule(err);
-            Error::CFError(format!("{:?}",err))
+            Error::CFError(format!("{:?}", err))
         }
     }
 }

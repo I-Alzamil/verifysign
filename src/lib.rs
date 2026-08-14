@@ -55,14 +55,14 @@ impl CodeSignVerifier {
     /// Create a verifier for a binary at a given path.
     /// On macOS it can be either a binary or an application package.
     pub fn for_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Verifier::for_file(path).map(|v| CodeSignVerifier(v))
+        Verifier::for_file(path).map(CodeSignVerifier)
     }
 
     /// Create a verifier for a running application by PID.
     /// On Windows it will get the full path to the running application first.
     /// This can be used for e.g. verifying the app on the other end of a pipe.
     pub fn for_pid(pid: u32) -> Result<Self, Error> {
-        Verifier::for_pid(pid).map(|v| CodeSignVerifier(v))
+        Verifier::for_pid(pid).map(CodeSignVerifier)
     }
 
     /// Perform the verification itself.
@@ -72,12 +72,12 @@ impl CodeSignVerifier {
     /// # Examples
     ///
     /// ```no_run
-    /// use codesign_verify::CodeSignVerifier;
+    /// use verifysign::CodeSignVerifier;
     ///
     /// CodeSignVerifier::for_file("C:/Windows/explorer.exe").unwrap().verify().unwrap();
     /// ```
     pub fn verify(self) -> Result<SignatureContext, Error> {
-        self.0.verify().map(|c| SignatureContext(c))
+        self.0.verify().map(SignatureContext)
     }
 }
 
@@ -87,7 +87,7 @@ impl SignatureContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use codesign_verify::CodeSignVerifier;
+    /// use verifysign::CodeSignVerifier;
     ///
     /// let ctx = CodeSignVerifier::for_file("C:/Windows/explorer.exe").unwrap().verify().unwrap();
     /// assert_eq!(

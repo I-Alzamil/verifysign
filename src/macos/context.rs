@@ -136,10 +136,10 @@ impl Context {
         let vals = self.get_as_section(field);
         unsafe {
             Name {
-                common_name: vals.as_ref().and_then(|a| Self::get_string(&a, CommonName)),
-                country: vals.as_ref().and_then(|a| Self::get_string(&a, Country)),
-                organization: vals.as_ref().and_then(|a| Self::get_string(&a, Org)),
-                organization_unit: vals.as_ref().and_then(|a| Self::get_string(&a, OrgUnit)),
+                common_name: vals.as_ref().and_then(|a| Self::get_string(a, CommonName)),
+                country: vals.as_ref().and_then(|a| Self::get_string(a, Country)),
+                organization: vals.as_ref().and_then(|a| Self::get_string(a, Org)),
+                organization_unit: vals.as_ref().and_then(|a| Self::get_string(a, OrgUnit)),
             }
         }
     }
