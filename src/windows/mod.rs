@@ -220,9 +220,13 @@ fn get_process_path(proc_id: u32) -> Result<String, Error> {
 
         let mut path_len = buf.len() as _;
 
-        match QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut path_len) {
+        let result = match QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut path_len) {
             0 => Err(Error::OsError(GetLastError() as i32)),
             _ => Ok(String::from_utf16_lossy(&buf[..path_len as usize])),
-        }
+        };
+
+        CloseHandle(proc_handle);
+
+        result
     }
 }

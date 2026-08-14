@@ -79,7 +79,7 @@ impl Context {
             )
         };
 
-        if len == 1 {
+        if len <= 1 {
             return None;
         }
 
@@ -95,6 +95,10 @@ impl Context {
                 buf.len() as _,
             )
         };
+
+        if len <= 1 {
+            return None;
+        }
 
         Some(
             std::ffi::OsString::from_wide(&buf[..len as usize - 1])
