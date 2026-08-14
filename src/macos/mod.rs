@@ -144,7 +144,13 @@ impl Verifier {
 
         match status {
             sec_sys::errSecSuccess => Ok(()),
-            sec_sys::errSecCSUnsigned => Err(Error::Unsigned),
+            sec_sys::errSecCSUnsigned => {
+                // errors is CF_RETURNS_RETAINED: release it even though we discard its contents.
+                if !err.is_null() {
+                    drop(unsafe { CFError::wrap_under_create_rule(err) });
+                }
+                Err(Error::Unsigned)
+            }
             status => {
                 if !err.is_null() {
                     Err(err.into())
@@ -162,7 +168,9 @@ impl From<CFErrorRef> for Error {
             panic!()
         }
         unsafe {
-            let err = CFError::wrap_under_get_rule(err);
+            // errors out-params on the Sec* APIs are CF_RETURNS_RETAINED: we own this
+            // reference already, so adopt it instead of retaining an extra one.
+            let err = CFError::wrap_under_create_rule(err);
             Error::CFError(format!("{:?}",err))
         }
     }
