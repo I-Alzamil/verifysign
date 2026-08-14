@@ -6,10 +6,10 @@ pub use windows_sys::Win32::{
         CloseHandle,
         GetLastError,
         GENERIC_READ,
-        ERROR_INVALID_PARAMETER,
-        INVALID_HANDLE_VALUE,
         TRUST_E_NOSIGNATURE,
+        INVALID_HANDLE_VALUE,
         TRUST_E_NO_SIGNER_CERT,
+        ERROR_INVALID_PARAMETER,
     }, 
     Security::{
         WinTrust::{

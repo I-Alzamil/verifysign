@@ -1,8 +1,8 @@
 mod context;
-mod wintrust_sys;
+mod win;
 
 use super::Error;
-use wintrust_sys::*;
+use win::*;
 
 pub(crate) struct Verifier(Vec<u16>);
 pub(crate) use context::Context;

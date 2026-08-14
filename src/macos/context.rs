@@ -1,4 +1,4 @@
-use super::sec_sys::*;
+use super::osx::*;
 use crate::Name;
 
 pub(crate) struct Context {

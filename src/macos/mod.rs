@@ -1,9 +1,9 @@
 mod context;
 #[allow(non_upper_case_globals)]
-mod sec_sys;
+mod osx;
 
 use super::Error;
-use sec_sys::*;
+use osx::*;
 
 pub(crate) struct Verifier(SecCodeKind);
 pub(crate) use context::Context;
@@ -33,7 +33,7 @@ impl Verifier {
                 SecCSFlags::kSecCSDefaultFlags,
                 Some(&mut sec),
             ) {
-                sec_sys::errSecSuccess if !sec.is_null() => Ok(Verifier(SecCodeKind::Dynamic(
+                osx::errSecSuccess if !sec.is_null() => Ok(Verifier(SecCodeKind::Dynamic(
                     SecCode::wrap_under_create_rule(sec),
                 ))),
                 err => Err(Error::OsError(err)),
@@ -52,7 +52,7 @@ impl Verifier {
                 SecCSFlags::kSecCSDefaultFlags,
                 Some(&mut sec),
             ) {
-                sec_sys::errSecSuccess if !sec.is_null() => Ok(Verifier(SecCodeKind::Static(
+                osx::errSecSuccess if !sec.is_null() => Ok(Verifier(SecCodeKind::Static(
                     SecStaticCode::wrap_under_create_rule(sec),
                 ))),
                 err => Err(Error::OsError(err)),
@@ -90,7 +90,7 @@ impl Verifier {
                 SecCSFlags::kSecCSSigningInformation,
                 Some(&mut dict),
             ) {
-                sec_sys::errSecSuccess if !dict.is_null() => {
+                osx::errSecSuccess if !dict.is_null() => {
                     Ok(CFDictionary::wrap_under_create_rule(dict))
                 }
                 err => Err(Error::OsError(err)),
@@ -110,7 +110,7 @@ impl Verifier {
                 Some(&mut err),
                 Some(&mut req),
             ) {
-                sec_sys::errSecSuccess if !req.is_null() => {
+                osx::errSecSuccess if !req.is_null() => {
                     SecRequirement::wrap_under_create_rule(req)
                 }
                 status => {
@@ -143,8 +143,8 @@ impl Verifier {
         };
 
         match status {
-            sec_sys::errSecSuccess => Ok(()),
-            sec_sys::errSecCSUnsigned => {
+            osx::errSecSuccess => Ok(()),
+            osx::errSecCSUnsigned => {
                 // errors is CF_RETURNS_RETAINED: release it even though we discard its contents.
                 if !err.is_null() {
                     drop(unsafe { CFError::wrap_under_create_rule(err) });

@@ -1,4 +1,4 @@
-use super::wintrust_sys::*;
+use super::win::*;
 use crate::Name;
 
 pub(crate) struct Context {
