@@ -3,13 +3,21 @@ pub use core_foundation::base::{CFType, CFTypeID, OSStatus, TCFType};
 pub use core_foundation::data::{CFData, CFDataRef};
 pub use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 pub use core_foundation::error::{CFError, CFErrorRef};
-pub use core_foundation::number::CFNumber;
+pub use core_foundation::number::{CFNumber, CFNumberRef};
 pub use core_foundation::string::{CFString, CFStringRef};
 pub use core_foundation::url::{CFURLRef, CFURL};
 pub use core_foundation::{declare_TCFType, impl_CFTypeDescription, impl_TCFType};
 
 pub const errSecSuccess: OSStatus = 0;
 pub const errSecCSUnsigned: OSStatus = -67062;
+
+/// Mirrors `CS_ADHOC` from `<Security/CSCommon.h>` / `cs_blobs.h`: set in
+/// `kSecCodeInfoFlags` when a binary carries only an ad-hoc signature (a bare
+/// integrity hash, no certificate/identity). The Apple Silicon linker stamps this
+/// on every arm64 binary automatically so the kernel will run it at all, which is
+/// why locally-built arm64 binaries are never truly "unsigned" the way x86_64
+/// ones are.
+pub const kSecCodeSignatureAdhoc: u32 = 0x00000002;
 
 pub struct __SecCode {}
 pub struct __SecStaticCode {}
@@ -113,6 +121,7 @@ unsafe extern "C" {
 
     pub unsafe static kSecGuestAttributePid: CFStringRef;
     pub unsafe static kSecCodeInfoCertificates: CFStringRef;
+    pub unsafe static kSecCodeInfoFlags: CFStringRef;
 
     pub unsafe static kSecPropertyKeyValue: CFStringRef;
     pub unsafe static kSecPropertyKeyLabel: CFStringRef;

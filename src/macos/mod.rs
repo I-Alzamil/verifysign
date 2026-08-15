@@ -61,7 +61,23 @@ impl Verifier {
     }
 
     pub fn verify(&self) -> Result<Context, Error> {
-        self.check_validity("anchor trusted")?; // This is the most generic verification
+        // "anchor trusted" is the most generic verification: it requires the signer's
+        // certificate chain to terminate in a trust anchor the system actually trusts.
+        //
+        // On arm64, the linker auto-signs every binary with an ad-hoc signature (no
+        // certificate at all) so the kernel will run it, so that check fails with
+        // errSecCSReqFailed instead of errSecCSUnsigned. Treat that case as unsigned
+        // too, so behavior matches x86_64 (where an unsigned build has no signature
+        // whatsoever and fails with errSecCSUnsigned directly) — a bare ad-hoc hash
+        // carries no identity to report anyway.
+        if let Err(err) = self.check_validity("anchor trusted") {
+            return Err(match err {
+                Error::Unsigned => Error::Unsigned,
+                _ if self.is_adhoc_signed() => Error::Unsigned,
+                other => other,
+            });
+        }
+
         let sec_info = self.get_code_singing_info()?;
         let cert_key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoCertificates) };
 
@@ -96,6 +112,26 @@ impl Verifier {
                 err => Err(Error::OsError(err)),
             }
         }
+    }
+
+    /// Best-effort check for whether the code carries only an ad-hoc signature (no
+    /// certificate/identity attached). Returns `false` — rather than propagating an
+    /// error — if the probe itself fails, so callers fall back to the original error.
+    fn is_adhoc_signed(&self) -> bool {
+        let Ok(info) = self.get_code_singing_info() else {
+            return false;
+        };
+
+        let flags_key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoFlags) };
+
+        let Some(flags_ref) = info.find(flags_key.as_CFTypeRef()) else {
+            return false;
+        };
+
+        let flags = unsafe { CFNumber::wrap_under_get_rule(*flags_ref as CFNumberRef) };
+        let flags = flags.to_i64().unwrap_or(0) as u32;
+
+        flags & kSecCodeSignatureAdhoc != 0
     }
 
     fn check_validity(&self, requirement: &str) -> Result<(), Error> {
