@@ -8,6 +8,9 @@ use macos::{Context, Verifier};
 #[cfg(windows)]
 use windows::{Context, Verifier};
 
+#[cfg(not(any(target_os = "macos", windows)))]
+compile_error!("verifysign only supports macOS and Windows targets");
+
 ///
 /// Used to verify the validity of a code signature
 ///
