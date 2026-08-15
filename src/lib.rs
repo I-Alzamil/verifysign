@@ -172,12 +172,15 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_subject_name_oid_properties() {
-        let ctx = signed_context("/sbin/ping").unwrap();
+        // Ask codesign/openssl for the leaf certificate's fields instead of relying on
+        // hardcoded values, since Apple periodically rotates the signing certificate.
+        let path = "/sbin/ping";
+        let ctx = signed_context(path).unwrap();
+        let cert = extract_leaf_certificate(path);
 
-        // If this begins to fail, Apple probably changed their signing certificate
         assert_eq!(
-            ctx.subject_name().organization.as_deref(),
-            Some("Apple Inc.")
+            ctx.subject_name().organization,
+            macos_cert_field(&cert, "-subject", "O")
         );
     }
 
@@ -199,11 +202,13 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_issuer_name_oid_properties() {
-        let ctx = signed_context("/sbin/ping").unwrap();
+        let path = "/sbin/ping";
+        let ctx = signed_context(path).unwrap();
+        let cert = extract_leaf_certificate(path);
 
         assert_eq!(
-            ctx.issuer_name().organization_unit.as_deref(),
-            Some("Apple Certification Authority")
+            ctx.issuer_name().organization_unit,
+            macos_cert_field(&cert, "-issuer", "OU")
         );
     }
 
@@ -225,14 +230,12 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_thumbprints() {
-        let ctx = signed_context("/sbin/ping").unwrap();
+        let path = "/sbin/ping";
+        let ctx = signed_context(path).unwrap();
+        let cert = extract_leaf_certificate(path);
 
-        // If this begins to fail, Apple probably rotated their signing certificate
-        assert_eq!(
-            ctx.sha1_thumbprint(),
-            "efdbc9139dd98dbae5a9c7165a096511b15eaef9"
-        );
-        assert_eq!(ctx.sha256_thumbprint().len(), 64);
+        assert_eq!(ctx.sha1_thumbprint(), macos_cert_fingerprint(&cert, "-sha1"));
+        assert_eq!(ctx.sha256_thumbprint(), macos_cert_fingerprint(&cert, "-sha256"));
     }
 
     #[test]
@@ -254,8 +257,11 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn test_serial_number() {
-        let ctx = signed_context("/sbin/ping").unwrap();
-        assert!(ctx.serial().is_some());
+        let path = "/sbin/ping";
+        let ctx = signed_context(path).unwrap();
+        let cert = extract_leaf_certificate(path);
+
+        assert_eq!(ctx.serial(), Some(macos_cert_serial(&cert)));
     }
 
     #[test]
@@ -278,6 +284,70 @@ mod tests {
 
     fn signed_context(path: &str) -> Result<SignatureContext, Error> {
         super::CodeSignVerifier::for_file(path)?.verify()
+    }
+
+    // Extracts the leaf signing certificate from a binary via `codesign` so tests can compare
+    // against it instead of relying on hardcoded values, since Apple periodically rotates the
+    // signing certificate.
+    #[cfg(target_os = "macos")]
+    fn extract_leaf_certificate(path: &str) -> std::path::PathBuf {
+        let prefix = std::env::temp_dir().join(format!("verifysign-test-{}", std::process::id()));
+        let output = std::process::Command::new("codesign")
+            .arg("-d")
+            .arg(format!("--extract-certificates={}", prefix.display()))
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "codesign --extract-certificates failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        std::path::PathBuf::from(format!("{}0", prefix.display()))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn openssl_x509(cert: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("openssl")
+            .args(["x509", "-inform", "DER", "-in"])
+            .arg(cert)
+            .arg("-noout")
+            .args(args)
+            .output()
+            .unwrap();
+
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    // Parses a `subject= /CN=.../O=.../C=US`-style openssl name line for the given RDN key.
+    #[cfg(target_os = "macos")]
+    fn macos_cert_field(cert: &std::path::Path, which: &str, key: &str) -> Option<String> {
+        let line = openssl_x509(cert, &[which]);
+        let rdns = line.split_once('/')?.1;
+
+        rdns.split('/').find_map(|rdn| {
+            let (k, v) = rdn.split_once('=')?;
+            (k == key).then(|| v.to_string())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_cert_fingerprint(cert: &std::path::Path, algo: &str) -> String {
+        openssl_x509(cert, &["-fingerprint", algo])
+            .rsplit('=')
+            .next()
+            .unwrap()
+            .replace(':', "")
+            .to_lowercase()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_cert_serial(cert: &std::path::Path) -> String {
+        let hex = openssl_x509(cert, &["-serial"]);
+        let hex = hex.trim_start_matches("serial=");
+
+        u128::from_str_radix(hex, 16).unwrap().to_string()
     }
 
     #[cfg(windows)]
