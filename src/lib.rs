@@ -136,23 +136,12 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn test_signature_detected_win_embedded() {
-        // svchost.exe carries an embedded Authenticode signature
-        let svchost = format!("{}\\system32\\svchost.exe", std::env::var("windir").unwrap());
-        assert!(signed_context(&svchost).is_ok());
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn test_signature_detected_win_catalog() {
+    fn test_signature_detected() {
+        // explorer.exe carries an embedded Authenticode signature
+        assert!(signed_context(&explorer_path()).is_ok());
         // cmd.exe is validated via a catalog signature rather than an embedded one;
         // this exercises the WTHelperGetProvCertFromChain catalog lookup path.
-        let cmd = format!("{}\\system32\\cmd.exe", std::env::var("windir").unwrap());
-        let ctx = signed_context(&cmd).unwrap();
-        assert_eq!(
-            ctx.issuer_name().organization.as_deref(),
-            Some("Microsoft Corporation")
-        );
+        assert!(signed_context(&cmd_path()).is_ok());
     }
 
     #[test]
@@ -187,12 +176,16 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_subject_name_oid_properties() {
-        let ctx = signed_context(&explorer_path()).unwrap();
+        // Ask Windows itself for the leaf certificate's subject fields instead of relying on
+        // hardcoded values, since Microsoft periodically rotates the signing certificate.
+        for path in [explorer_path(), cmd_path()] {
+            let ctx = signed_context(&path).unwrap();
 
-        assert_eq!(
-            ctx.subject_name().organization.as_deref(),
-            Some("Microsoft Corporation")
-        );
+            assert_eq!(
+                ctx.subject_name().organization,
+                windows_cert_field(&path, "Subject", "O")
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -215,12 +208,16 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn test_issuer_name_oid_properties() {
-        let ctx = signed_context(&explorer_path()).unwrap();
+        // Ask Windows itself for the leaf certificate's issuer fields instead of relying on
+        // hardcoded values, since Microsoft periodically rotates the signing certificate.
+        for path in [explorer_path(), cmd_path()] {
+            let ctx = signed_context(&path).unwrap();
 
-        assert_eq!(
-            ctx.issuer_name().common_name.as_deref(),
-            Some("Microsoft Windows Production PCA 2011")
-        );
+            assert_eq!(
+                ctx.issuer_name().common_name,
+                windows_cert_field(&path, "Issuer", "CN")
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -243,11 +240,15 @@ mod tests {
     fn test_thumbprints() {
         // Ask Windows itself for the signer certificate's thumbprints instead of relying on
         // hardcoded values, since Microsoft periodically rotates the signing certificate.
-        let path = explorer_path();
-        let ctx = signed_context(&path).unwrap();
+        for path in [explorer_path(), cmd_path()] {
+            let ctx = signed_context(&path).unwrap();
 
-        assert_eq!(ctx.sha1_thumbprint(), windows_signer_property(&path, "Thumbprint"));
-        assert_eq!(ctx.sha256_thumbprint(), windows_sha256_thumbprint(&path));
+            assert_eq!(
+                ctx.sha1_thumbprint(),
+                windows_signer_property(&path, "Thumbprint").to_lowercase()
+            );
+            assert_eq!(ctx.sha256_thumbprint(), windows_sha256_thumbprint(&path));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -269,13 +270,14 @@ mod tests {
     fn test_serial_number() {
         // Ask Windows itself for the signer certificate's serial number instead of relying on
         // a hardcoded value, since Microsoft periodically rotates the signing certificate.
-        let path = explorer_path();
-        let ctx = signed_context(&path).unwrap();
+        for path in [explorer_path(), cmd_path()] {
+            let ctx = signed_context(&path).unwrap();
 
-        assert_eq!(
-            ctx.serial().unwrap_or_default(),
-            windows_signer_property(&path, "SerialNumber")
-        );
+            assert_eq!(
+                ctx.serial().unwrap_or_default(),
+                windows_signer_property(&path, "SerialNumber").to_lowercase()
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -350,9 +352,17 @@ mod tests {
         u128::from_str_radix(hex, 16).unwrap().to_string()
     }
 
+    // explorer.exe carries an embedded Authenticode signature and should always be present.
     #[cfg(windows)]
     fn explorer_path() -> String {
-        format!("{}\\explorer.exe", std::env::var("windir").unwrap()) // Should always be present on Windows
+        format!("{}\\explorer.exe", std::env::var("windir").unwrap())
+    }
+
+    // cmd.exe is validated via a catalog signature rather than an embedded one and should
+    // always be present.
+    #[cfg(windows)]
+    fn cmd_path() -> String {
+        format!("{}\\system32\\cmd.exe", std::env::var("windir").unwrap())
     }
 
     // Runs Windows PowerShell (not the pwsh we may be hosted under) for a one-off `-Command`.
@@ -366,7 +376,7 @@ mod tests {
             .output()
             .unwrap();
 
-        String::from_utf8_lossy(&output.stdout).trim().to_lowercase()
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[cfg(windows)]
@@ -377,12 +387,25 @@ mod tests {
         ))
     }
 
+    // Parses a `.SignerCertificate.Subject`/`.Issuer`-style distinguished name
+    // (e.g. "CN=..., O=..., C=US") for the given RDN key, mirroring the macOS
+    // `macos_cert_field` helper so fields are asked of the OS rather than hardcoded.
+    #[cfg(windows)]
+    fn windows_cert_field(path: &str, which: &str, key: &str) -> Option<String> {
+        let dn = windows_signer_property(path, which);
+
+        dn.split(',').find_map(|rdn| {
+            let (k, v) = rdn.trim().split_once('=')?;
+            k.eq_ignore_ascii_case(key).then(|| v.trim().to_string())
+        })
+    }
+
     #[cfg(windows)]
     fn windows_sha256_thumbprint(path: &str) -> String {
         run_powershell(&format!(
             "$c = (Get-AuthenticodeSignature -FilePath '{}').SignerCertificate; \
              [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData)) -replace '-',''",
             path
-        ))
+        )).to_lowercase()
     }
 }
