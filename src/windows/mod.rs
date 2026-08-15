@@ -176,15 +176,19 @@ impl Verifier {
         data.dwStateAction = WTD_STATEACTION_VERIFY;
         data.dwUIContext = WTD_UICONTEXT_EXECUTE;
 
+        let common_prov_flags =
+            WTD_DISABLE_MD2_MD4 | 
+            WTD_REVOCATION_CHECK_END_CERT | 
+            WTD_CACHE_ONLY_URL_RETRIEVAL;
+
         if let Some(fi) = file_info {
             data.dwUnionChoice = WTD_CHOICE_FILE;
             data.Anonymous.pFile = fi;
-            data.dwProvFlags =
-                WTD_DISABLE_MD2_MD4 | WTD_REVOCATION_CHECK_END_CERT | WTD_NO_IE4_CHAIN_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+            data.dwProvFlags = common_prov_flags | WTD_NO_IE4_CHAIN_FLAG;
         } else if let Some(ci) = catalog_info {
             data.dwUnionChoice = WTD_CHOICE_CATALOG;
             data.Anonymous.pCatalog = ci;
-            data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_USE_DEFAULT_OSVER_CHECK;
+            data.dwProvFlags = common_prov_flags | WTD_USE_DEFAULT_OSVER_CHECK;
         } else {
             return Err(ERROR_INVALID_PARAMETER);
         }
