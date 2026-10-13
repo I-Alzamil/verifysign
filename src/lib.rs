@@ -718,15 +718,22 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    // Parses a `subject= /CN=.../O=.../C=US`-style openssl name line for the given RDN key.
+    // Parses an openssl `-subject`/`-issuer` line for the given RDN key. macOS's LibreSSL
+    // (/usr/bin/openssl) prints `subject= /C=US/O=Apple Inc./CN=...`, while OpenSSL 3 (e.g.
+    // Homebrew's, first on PATH on GitHub's runners) prints `subject=C = US, O = Apple Inc., CN = ...`.
     #[cfg(target_os = "macos")]
     fn macos_cert_field(cert: &LeafCert, which: &str, key: &str) -> Option<String> {
         let line = openssl_x509(cert, &[which]);
-        let rdns = line.split_once('/')?.1;
+        let names = line.split_once('=')?.1.trim();
 
-        rdns.split('/').find_map(|rdn| {
+        let mut rdns: Box<dyn Iterator<Item = &str>> = match names.strip_prefix('/') {
+            Some(names) => Box::new(names.split('/')),
+            None => Box::new(names.split(", ")),
+        };
+
+        rdns.find_map(|rdn| {
             let (k, v) = rdn.split_once('=')?;
-            (k == key).then(|| v.to_string())
+            (k.trim() == key).then(|| v.trim().to_string())
         })
     }
 
