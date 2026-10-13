@@ -68,7 +68,9 @@ impl Verifier {
 
         match unsafe { self.verify_internal(TrustSubject::File(&mut file_info)) } {
             Ok(context) => Ok(context),
-            Err(TRUST_E_NOSIGNATURE) => self.verify_catalog_signed(&path),
+            // No embedded signature, or a file type that can't embed one (e.g. .inf): it may
+            // still be signed through a system catalog.
+            Err(TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN) => self.verify_catalog_signed(&path),
             Err(err) => Err(Error::OsError(err)),
         }
     }
@@ -98,7 +100,9 @@ impl Verifier {
         let h_file = unsafe { CreateFileW(
             path.as_ptr(),
             GENERIC_READ,
-            FILE_SHARE_READ,
+            // Allow others to read, rename or delete the file meanwhile, but not to write it
+            // while it is being hashed.
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
             std::ptr::null_mut(),
             OPEN_EXISTING,
             0,
@@ -106,7 +110,7 @@ impl Verifier {
         ) };
 
         if h_file == INVALID_HANDLE_VALUE {
-            let err = unsafe { GetLastError() } as i32;
+            let err = last_error();
             return Err(Error::OsError(err));
         }
 
@@ -121,7 +125,7 @@ impl Verifier {
             0,
         ) };
         if result == 0 {
-            let err = unsafe { GetLastError() } as i32;
+            let err = last_error();
             return Err(Error::OsError(err));
         }
 
@@ -138,7 +142,7 @@ impl Verifier {
             0,
         ) };
         if result == 0 {
-            let err = unsafe { GetLastError() } as i32;
+            let err = last_error();
             return Err(Error::OsError(err));
         }
         let hash_buffer = &hash_buffer[..hash_size as usize];
@@ -172,7 +176,7 @@ impl Verifier {
             ci.cbStruct = std::mem::size_of::<CATALOG_INFO>() as u32;
 
             if unsafe { CryptCATCatalogInfoFromContext(h_cat_info, &mut ci, 0) } == 0 {
-                last_err = Some(unsafe { GetLastError() } as i32);
+                last_err = Some(last_error());
                 continue;
             }
 
@@ -267,6 +271,22 @@ fn trust_flags(policy: &VerifyPolicy) -> (u32, u32) {
     (revocation_checks, prov_flags)
 }
 
+/// The calling thread's last error, as an HRESULT.
+fn last_error() -> i32 {
+    hresult_from_win32(unsafe { GetLastError() })
+}
+
+/// `HRESULT_FROM_WIN32`: maps a Win32 error code into the `0x8007xxxx` HRESULT range, so
+/// `Error::OsError` holds an HRESULT on every path. Values already in HRESULT form (some
+/// crypto APIs set those as the last error) and zero are returned unchanged.
+fn hresult_from_win32(code: u32) -> i32 {
+    if code as i32 <= 0 {
+        code as i32
+    } else {
+        ((code & 0xFFFF) | 0x8007_0000) as i32
+    }
+}
+
 /// Encodes `path` as a null terminated UTF-16 string for the Win32 APIs.
 fn wide_path(path: &std::path::Path) -> Result<Vec<u16>, Error> {
     use std::os::windows::ffi::OsStrExt;
@@ -292,7 +312,7 @@ fn get_process_path(proc_id: u32) -> Result<std::ffi::OsString, Error> {
     unsafe {
         let proc_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc_id);
         if proc_handle.is_null() {
-            return Err(Error::OsError(GetLastError() as i32));
+            return Err(Error::OsError(last_error()));
         }
 
         let mut buf = vec![0u16; 1024];
@@ -305,7 +325,7 @@ fn get_process_path(proc_id: u32) -> Result<std::ffi::OsString, Error> {
 
             let err = GetLastError();
             if err != ERROR_INSUFFICIENT_BUFFER || buf.len() >= MAX_LEN {
-                break Err(Error::OsError(err as i32));
+                break Err(Error::OsError(hresult_from_win32(err)));
             }
             buf.resize(buf.len() * 2, 0);
         };
@@ -349,6 +369,15 @@ mod tests {
 
         assert_ne!(trust_flags(&offline_revocation).1 & WTD_CACHE_ONLY_URL_RETRIEVAL, 0);
         assert_eq!(trust_flags(&online).1 & WTD_CACHE_ONLY_URL_RETRIEVAL, 0);
+    }
+
+    #[test]
+    fn test_hresult_from_win32() {
+        assert_eq!(hresult_from_win32(0), 0);
+        // ERROR_FILE_NOT_FOUND
+        assert_eq!(hresult_from_win32(2), 0x8007_0002_u32 as i32);
+        // Already an HRESULT (TRUST_E_NOSIGNATURE): unchanged.
+        assert_eq!(hresult_from_win32(TRUST_E_NOSIGNATURE as u32), TRUST_E_NOSIGNATURE);
     }
 
     #[test]

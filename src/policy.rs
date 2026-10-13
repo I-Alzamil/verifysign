@@ -42,9 +42,9 @@ pub struct VerifyPolicy {
     pub(crate) revocation: Revocation,
     pub(crate) allow_network: Option<bool>,
     pub(crate) strict_expiration: bool,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", doc))]
     pub(crate) requirement: String,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", doc))]
     pub(crate) all_architectures: bool,
 }
 
@@ -54,9 +54,9 @@ impl Default for VerifyPolicy {
             revocation: Revocation::None,
             allow_network: None,
             strict_expiration: false,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", doc))]
             requirement: "anchor trusted".to_string(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", doc))]
             all_architectures: true,
         }
     }
@@ -102,8 +102,9 @@ impl VerifyPolicy {
     /// leaf[subject.OU] = "TEAMID1234"` pins a specific developer team.
     ///
     /// A requirement that fails to parse makes [`CodeSignVerifier::new`](crate::CodeSignVerifier::new)
-    /// return [`Error::CFError`](crate::Error::CFError).
-    #[cfg(target_os = "macos")]
+    /// return `Error::CFError`.
+    #[cfg(any(target_os = "macos", doc))]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
     pub fn requirement(mut self, requirement: impl Into<String>) -> Self {
         self.requirement = requirement.into();
         self
@@ -111,7 +112,8 @@ impl VerifyPolicy {
 
     /// Validate every architecture of a universal binary (the default), or only the host's.
     /// Only applies to files; a running process is always validated for its own architecture.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", doc))]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "macos")))]
     pub fn check_all_architectures(mut self, all: bool) -> Self {
         self.all_architectures = all;
         self

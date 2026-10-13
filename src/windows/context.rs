@@ -6,6 +6,12 @@ pub(crate) struct Context {
     leaf_cert_ptr: *const CERT_CONTEXT,
 }
 
+// SAFETY: the Context exclusively owns the WinTrust state data, which has no thread affinity
+// and is closed exactly once, on drop. The leaf certificate belongs to that state and is only
+// read through CryptoAPI certificate functions, which are safe to call concurrently.
+unsafe impl Send for Context {}
+unsafe impl Sync for Context {}
+
 impl Drop for Context {
     fn drop(&mut self) {
         close_data(self.data);
@@ -58,7 +64,13 @@ impl Context {
                 cert => cert,
             };
 
-            ret.leaf_cert_ptr = crypt_prov_cert.as_ref().unwrap().pCert;
+            // Every other method dereferences the leaf certificate, so it must not be null.
+            ret.leaf_cert_ptr = match (*crypt_prov_cert).pCert {
+                cert if cert.is_null() || (*cert).pCertInfo.is_null() => {
+                    return Err(TRUST_E_NO_SIGNER_CERT);
+                }
+                cert => cert,
+            };
         }
 
         Ok(ret)
@@ -105,15 +117,13 @@ impl Context {
     }
 
     pub fn serial(&self) -> Option<String> {
-        let serial_blob = unsafe {
-            self.leaf_cert_ptr
-                .as_ref()
-                .unwrap()
-                .pCertInfo
-                .as_ref()
-                .unwrap()
-                .SerialNumber
-        };
+        // Both pointers are checked to be non-null in `new`.
+        let serial_blob = unsafe { (*(*self.leaf_cert_ptr).pCertInfo).SerialNumber };
+
+        // An empty blob may have a null data pointer, which from_raw_parts doesn't allow.
+        if serial_blob.cbData == 0 || serial_blob.pbData.is_null() {
+            return None;
+        }
 
         let blob =
             unsafe { std::slice::from_raw_parts(serial_blob.pbData, serial_blob.cbData as usize) };

@@ -8,6 +8,11 @@ pub(crate) struct Context {
     values: Option<CFDictionary>,
 }
 
+// SAFETY: both fields are immutable CF objects that are never mutated after creation;
+// immutable CF objects may be shared, read and released from any thread.
+unsafe impl Send for Context {}
+unsafe impl Sync for Context {}
+
 /// Wraps one of the Security framework's constant `CFStringRef` keys.
 fn key(key: CFStringRef) -> CFString {
     unsafe { CFString::wrap_under_get_rule(key) }

@@ -32,6 +32,15 @@
 //! }
 //! # Ok::<(), verifysign::Error>(())
 //! ```
+//!
+//! # Platform differences
+//!
+//! [`VerifyPolicy::requirement`] and [`VerifyPolicy::check_all_architectures`] exist only on
+//! macOS, as does the `Error::CFError` variant, which carries a Core Foundation error
+//! description (for example when a requirement fails to parse or isn't satisfied). On docs.rs,
+//! pick a macOS target from the platform menu to see them all.
+
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -59,7 +68,8 @@ compile_error!("verifysign only supports macOS and Windows targets");
 pub struct CodeSignVerifier(Verifier);
 
 ///
-/// Used to extract additional information from the signing leaf certificate
+/// Used to extract additional information from the signing leaf certificate.
+/// It can be sent to and shared between threads.
 ///
 pub struct SignatureContext(Context);
 
@@ -84,13 +94,21 @@ pub struct Name {
     pub country: Option<String>,           // 2.5.4.6
 }
 
+/// Why a verification failed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    Unsigned,         // The binary file didn't have any signature
-    OsError(i32),     // Wraps an inner provider error code (HRESULT on Windows, OSStatus on macOS)
-    InvalidPath,      // The provided path was malformed
-    LeafCertNotFound, // Unable to fetch certificate information
+    /// The file or process has no signature.
+    Unsigned,
+    /// The platform reported an error: an `HRESULT` on Windows (Win32 error codes are
+    /// converted to their `0x8007xxxx` form), an `OSStatus` on macOS. This includes a
+    /// signature that is present but invalid, e.g. `TRUST_E_BAD_DIGEST` for a modified file.
+    OsError(i32),
+    /// The provided path is malformed.
+    InvalidPath,
+    /// The signature is valid but its signing (leaf) certificate could not be read.
+    LeafCertNotFound,
+    /// A Core Foundation error, with its description. macOS only.
     #[cfg(target_os = "macos")]
     CFError(String),
 }
@@ -134,8 +152,9 @@ impl CodeSignVerifier {
     ///
     /// # Errors
     ///
-    /// On macOS, returns [`Error::CFError`] if the policy's
-    /// [`requirement`](VerifyPolicy::requirement) fails to parse. It never fails on Windows.
+    /// On macOS, returns `Error::CFError` if the policy's
+    /// [`requirement`](VerifyPolicy::requirement) fails to parse.
+    /// It never fails on Windows.
     pub fn new(policy: VerifyPolicy) -> Result<Self, Error> {
         Verifier::new(policy).map(CodeSignVerifier)
     }
@@ -186,6 +205,17 @@ impl Default for CodeSignVerifier {
     /// A verifier using [`VerifyPolicy::default()`].
     fn default() -> Self {
         Self::new(VerifyPolicy::default()).expect("the default policy is always valid")
+    }
+}
+
+impl std::fmt::Debug for SignatureContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignatureContext")
+            .field("subject_name", &self.subject_name())
+            .field("issuer_name", &self.issuer_name())
+            .field("serial", &self.serial())
+            .field("sha256_thumbprint", &self.sha256_thumbprint())
+            .finish()
     }
 }
 
@@ -240,7 +270,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{CodeSignVerifier, Error, SignatureContext, VerifyPolicy};
+    use crate::{CodeSignVerifier, Error, Revocation, SignatureContext, VerifyPolicy};
 
     // ------------------------------------------------------------------
     // 1. Detection: a signature is (or isn't) found on a binary
@@ -275,6 +305,122 @@ mod tests {
         assert!(matches!(super::verify_pid(std::process::id()), Err(Error::Unsigned)));
     }
 
+    #[test]
+    fn test_missing_target_is_an_error_not_unsigned() {
+        let missing = std::env::temp_dir().join("verifysign-test-does-not-exist.exe");
+
+        assert!(matches!(super::verify_file(&missing), Err(Error::OsError(_))));
+        assert!(matches!(super::verify_pid(u32::MAX), Err(Error::OsError(_))));
+
+        // Win32 errors are reported as HRESULTs, like the WinTrust ones.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CRYPT_E_FILE_ERROR, E_INVALIDARG};
+
+            assert!(matches!(super::verify_file(&missing), Err(Error::OsError(CRYPT_E_FILE_ERROR))));
+            // From OpenProcess's ERROR_INVALID_PARAMETER.
+            assert!(matches!(super::verify_pid(u32::MAX), Err(Error::OsError(E_INVALIDARG))));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_signed_process_detected() {
+        let ping = format!("{}\\System32\\PING.EXE", std::env::var("windir").unwrap());
+        let mut child = std::process::Command::new(&ping)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let result = super::verify_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(
+            result.unwrap().sha256_thumbprint(),
+            signed_context(&ping).unwrap().sha256_thumbprint()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_copy_with_non_ascii_path_verifies() {
+        // Embedded signatures travel with the file and catalog signatures match on its hash,
+        // so an exact copy verifies the same; the path exercises the UTF-16 conversion.
+        let dir = TempDir::new();
+
+        for original in [explorer_path(), cmd_path()] {
+            let copy = dir.0.join(format!("signé copy ✓ {}", original.rsplit('\\').next().unwrap()));
+            std::fs::copy(&original, &copy).unwrap();
+
+            assert_eq!(
+                super::verify_file(&copy).unwrap().sha256_thumbprint(),
+                signed_context(&original).unwrap().sha256_thumbprint()
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_tampered_copy_rejected() {
+        use windows_sys::Win32::Foundation::TRUST_E_BAD_DIGEST;
+
+        let dir = TempDir::new();
+        let tampered = |original: &str| {
+            let mut bytes = std::fs::read(original).unwrap();
+            let middle = bytes.len() / 2; // Well inside the hashed image, before the signature
+            bytes[middle] ^= 0xff;
+
+            let path = dir.0.join(original.rsplit('\\').next().unwrap());
+            std::fs::write(&path, bytes).unwrap();
+            super::verify_file(path)
+        };
+
+        // Still carries its signature, but the content no longer matches it.
+        assert!(matches!(tampered(&explorer_path()), Err(Error::OsError(TRUST_E_BAD_DIGEST))));
+        // No embedded signature, and its new hash is in no catalog.
+        assert!(matches!(tampered(&cmd_path()), Err(Error::Unsigned)));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_non_pe_files_checked_against_catalogs() {
+        // An .inf can't embed a signature, but the system catalogs sign it.
+        let inf = format!("{}\\INF\\machine.inf", std::env::var("windir").unwrap());
+        let ctx = signed_context(&inf);
+        assert!(ctx.is_ok(), "{inf}: {:?}", ctx.err());
+
+        // A file type that can't embed a signature and that no catalog lists.
+        let dir = TempDir::new();
+        let text = dir.0.join("unsigned.txt");
+        std::fs::write(&text, "not signed").unwrap();
+        assert!(matches!(super::verify_file(&text), Err(Error::Unsigned)));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_catalog_check_shares_with_pending_delete() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+        // Another handle opened for reading and deleting/renaming (as an updater would) must
+        // not make the catalog lookup fail with a sharing violation.
+        let dir = TempDir::new();
+        let copy = dir.0.join("cmd.exe");
+        std::fs::copy(cmd_path(), &copy).unwrap();
+
+        let _other = std::fs::OpenOptions::new()
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(&copy)
+            .unwrap();
+
+        let ctx = super::verify_file(&copy);
+        assert!(ctx.is_ok(), "{:?}", ctx.err());
+    }
+
     // ------------------------------------------------------------------
     // Verification policy
     // ------------------------------------------------------------------
@@ -283,6 +429,18 @@ mod tests {
     fn test_offline_policy_accepts_signed_binary() {
         // Revocation off and no network: system binaries must still verify from local data.
         let verifier = CodeSignVerifier::new(VerifyPolicy::new().allow_network(false)).unwrap();
+
+        for path in signed_paths() {
+            let ctx = verifier.verify_file(&path);
+            assert!(ctx.is_ok(), "{path}: {:?}", ctx.err());
+        }
+    }
+
+    #[test]
+    #[ignore = "needs network access for OCSP/CRL; run with `cargo test -- --ignored`"]
+    fn test_online_revocation_accepts_signed_binary() {
+        let policy = VerifyPolicy::new().revocation(Revocation::Chain).allow_network(true);
+        let verifier = CodeSignVerifier::new(policy).unwrap();
 
         for path in signed_paths() {
             let ctx = verifier.verify_file(&path);
@@ -304,15 +462,26 @@ mod tests {
     fn test_verifier_shared_across_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CodeSignVerifier>();
+        assert_send_sync::<SignatureContext>();
 
         let verifier = CodeSignVerifier::default();
 
-        std::thread::scope(|s| {
-            for path in signed_paths() {
-                let verifier = &verifier;
-                s.spawn(move || assert!(verifier.verify_file(&path).is_ok(), "{path}"));
-            }
+        // Verify on worker threads, then read the results back on this one.
+        let contexts = std::thread::scope(|s| {
+            let handles: Vec<_> = signed_paths()
+                .into_iter()
+                .map(|path| {
+                    let verifier = &verifier;
+                    s.spawn(move || verifier.verify_file(&path).unwrap())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
         });
+
+        for (ctx, path) in contexts.iter().zip(signed_paths()) {
+            assert_eq!(ctx.sha256_thumbprint(), signed_context(&path).unwrap().sha256_thumbprint());
+            assert!(format!("{ctx:?}").contains("sha256_thumbprint"));
+        }
     }
 
     #[test]
@@ -576,6 +745,34 @@ mod tests {
         openssl_x509(cert, &["-serial"])
             .trim_start_matches("serial=")
             .to_lowercase()
+    }
+
+    // A temporary directory, removed on drop. Each one is unique since tests run concurrently
+    // within one process.
+    #[cfg(windows)]
+    struct TempDir(std::path::PathBuf);
+
+    #[cfg(windows)]
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+            let dir = std::env::temp_dir().join(format!(
+                "verifysign-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     // explorer.exe carries an embedded Authenticode signature and should always be present.

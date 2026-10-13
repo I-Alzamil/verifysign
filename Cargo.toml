@@ -2,7 +2,7 @@
 # Forked from codesign-verify-rs in 22/02/2025 credit to Vlad Krasnov <vlad@cloudflare.com>
 name = "verifysign"
 version = "1.0.0-dev"
-description = "A rust cargo used to verify digital code signature on files."
+description = "Verify the digital code signature of files and running processes on Windows and macOS."
 authors = ["Vlad Krasnov <vlad@cloudflare.com>","I-Alzamil <easysekker@gmail.com>"]
 edition = "2024"
 license = "BSD-3-Clause"
@@ -28,3 +28,4 @@ windows-sys = { version = "0.61", features = [
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
 targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
+rustdoc-args = ["--cfg", "docsrs"]
