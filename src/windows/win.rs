@@ -1,15 +1,15 @@
+pub use windows_sys::core::PCWSTR;
 pub use windows_sys::Win32::{
     Foundation::{
         FALSE,
         HANDLE,
-        WIN32_ERROR,
         CloseHandle,
         GetLastError,
         GENERIC_READ,
         TRUST_E_NOSIGNATURE,
         INVALID_HANDLE_VALUE,
         TRUST_E_NO_SIGNER_CERT,
-        ERROR_INVALID_PARAMETER,
+        ERROR_INSUFFICIENT_BUFFER,
     }, 
     Security::{
         WinTrust::{
@@ -30,7 +30,10 @@ pub use windows_sys::Win32::{
             WTD_CACHE_ONLY_URL_RETRIEVAL,
             WTHelperGetProvCertFromChain,
             WTHelperProvDataFromStateData,
+            WTD_REVOKE_WHOLECHAIN,
+            WTD_LIFETIME_SIGNING_FLAG,
             WTD_REVOCATION_CHECK_END_CERT,
+            WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
             WTHelperGetProvSignerFromChain,
             WINTRUST_ACTION_GENERIC_VERIFY_V2,
         },
@@ -43,6 +46,7 @@ pub use windows_sys::Win32::{
             CERT_NAME_ISSUER_FLAG,
             CERT_SHA1_HASH_PROP_ID,
             szOID_ORGANIZATION_NAME,
+            BCRYPT_SHA1_ALGORITHM,
             BCRYPT_SHA256_ALGORITHM,
             CERT_SHA256_HASH_PROP_ID,
             szOID_ORGANIZATIONAL_UNIT_NAME,

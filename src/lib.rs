@@ -1,7 +1,32 @@
+//! Verify the digital code signature of a file or running process on Windows and macOS,
+//! and read identifying details from the signing (leaf) certificate.
+//!
+//! On Windows verification goes through WinTrust (Authenticode, falling back to catalog
+//! signatures); on macOS it goes through the Security framework's code signing services.
+//!
+//! ```no_run
+//! use verifysign::{CodeSignVerifier, Error};
+//!
+//! match CodeSignVerifier::for_file("/path/to/binary").and_then(|v| v.verify()) {
+//!     Ok(ctx) => println!("signed by {:?}", ctx.subject_name().common_name),
+//!     Err(Error::Unsigned) => println!("not signed"),
+//!     Err(e) => println!("verification failed: {e}"),
+//! }
+//! ```
+//!
+//! # Policy
+//!
+//! Certificate revocation is **not** checked by default, so a file signed with a since-revoked
+//! certificate still verifies. Use a [`VerifyPolicy`] with [`CodeSignVerifier::policy`] to enable
+//! it, control network access, reject expired certificates and more.
+
 #[cfg(target_os = "macos")]
 mod macos;
+mod policy;
 #[cfg(windows)]
 mod windows;
+
+pub use policy::{Revocation, VerifyPolicy};
 
 #[cfg(target_os = "macos")]
 use macos::{Context, Verifier};
@@ -34,7 +59,7 @@ pub struct SignatureContext(Context);
 ///
 /// `country`: OID 2.5.4.6
 ///
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Name {
     pub common_name: Option<String>,       // 2.5.4.3
     pub organization: Option<String>,      // 2.5.4.10
@@ -43,14 +68,33 @@ pub struct Name {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
-    Unsigned,         // The binary file didn't have any singature
-    OsError(i32),     // Warps an inner provider error code
+    Unsigned,         // The binary file didn't have any signature
+    OsError(i32),     // Wraps an inner provider error code (HRESULT on Windows, OSStatus on macOS)
     InvalidPath,      // The provided path was malformed
     LeafCertNotFound, // Unable to fetch certificate information
     #[cfg(target_os = "macos")]
     CFError(String),
 }
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Unsigned => f.write_str("the file is not signed"),
+            #[cfg(windows)]
+            Error::OsError(code) => write!(f, "OS error {code:#010x}"),
+            #[cfg(not(windows))]
+            Error::OsError(code) => write!(f, "OS error {code}"),
+            Error::InvalidPath => f.write_str("the provided path is invalid"),
+            Error::LeafCertNotFound => f.write_str("unable to find the signing leaf certificate"),
+            #[cfg(target_os = "macos")]
+            Error::CFError(msg) => write!(f, "Core Foundation error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl CodeSignVerifier {
     /// Create a verifier for a binary at a given path.
@@ -60,14 +104,29 @@ impl CodeSignVerifier {
     }
 
     /// Create a verifier for a running application by PID.
-    /// On Windows it will get the full path to the running application first.
-    /// This can be used for e.g. verifying the app on the other end of a pipe.
+    ///
+    /// # Security
+    ///
+    /// A PID is not a stable identity: the process may exit and its PID be reused by another
+    /// process between the time the PID was obtained and the time this is called. On Windows
+    /// the PID is also resolved to the executable's path and the *file on disk* is verified,
+    /// not the image actually running in memory, so a file replaced after launch is not
+    /// detected. Do not rely on this alone to authenticate a peer (e.g. the other end of a
+    /// pipe) in security-sensitive contexts.
     pub fn for_pid(pid: u32) -> Result<Self, Error> {
         Verifier::for_pid(pid).map(CodeSignVerifier)
     }
 
-    /// Perform the verification itself.
-    /// On macOS the verification uses the Security framework with "anchor trusted" as the requirement.
+    /// Set the policy used by [`verify`](Self::verify). Without this, [`VerifyPolicy::default()`]
+    /// is used.
+    pub fn policy(mut self, policy: VerifyPolicy) -> Self {
+        self.0.set_policy(policy);
+        self
+    }
+
+    /// Perform the verification itself, according to the [`VerifyPolicy`].
+    /// On macOS the verification uses the Security framework with the policy's requirement
+    /// (by default "anchor trusted").
     /// On Windows the verification uses WinTrust and the `WINTRUST_ACTION_GENERIC_VERIFY_V2` action.
     ///
     /// # Examples
@@ -106,25 +165,36 @@ impl SignatureContext {
         self.0.issuer_name()
     }
 
-    /// Compute the sha1 thumbprint of the leaf certificate
+    /// Compute the sha1 thumbprint of the leaf certificate, as lowercase hex
     pub fn sha1_thumbprint(&self) -> String {
         self.0.sha1_thumbprint()
     }
 
-    /// Compute the sha256 thumbprint of the leaf certificate
+    /// Compute the sha256 thumbprint of the leaf certificate, as lowercase hex
     pub fn sha256_thumbprint(&self) -> String {
         self.0.sha256_thumbprint()
     }
 
-    /// Retrieve the leaf certificate serial number
+    /// Retrieve the leaf certificate serial number, as lowercase big-endian hex of the
+    /// DER-encoded integer (so it may start with `00`). The format is the same on all platforms.
     pub fn serial(&self) -> Option<String> {
         self.0.serial()
     }
 }
 
+/// Lowercase hex encoding shared by the platform backends.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{Error, SignatureContext};
+    use crate::{Error, SignatureContext, VerifyPolicy};
 
     // ------------------------------------------------------------------
     // 1. Detection: a signature is (or isn't) found on a binary
@@ -149,11 +219,64 @@ mod tests {
 
     #[test]
     fn test_unsigned_binary_not_detected() {
-        let path = std::env::args().next().unwrap(); // own path, always unsigned and present
+        let path = std::env::current_exe().unwrap(); // own path, always unsigned and present
 
         assert!(matches!(
             super::CodeSignVerifier::for_file(path).unwrap().verify(),
             Err(Error::Unsigned)
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Verification policy
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_offline_policy_accepts_signed_binary() {
+        // Revocation off and no network: system binaries must still verify from local data.
+        let policy = VerifyPolicy::new().allow_network(false);
+
+        for path in signed_paths() {
+            let ctx = super::CodeSignVerifier::for_file(&path).unwrap().policy(policy.clone()).verify();
+            assert!(ctx.is_ok(), "{path}: {:?}", ctx.err());
+        }
+    }
+
+    #[test]
+    fn test_policy_keeps_unsigned_binary_unsigned() {
+        let policy = VerifyPolicy::new().allow_network(false).strict_expiration(true);
+        let path = std::env::current_exe().unwrap();
+
+        assert!(matches!(
+            super::CodeSignVerifier::for_file(path).unwrap().policy(policy).verify(),
+            Err(Error::Unsigned)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_custom_requirement() {
+        let verify = |requirement: &str| {
+            super::CodeSignVerifier::for_file("/sbin/ping")
+                .unwrap()
+                .policy(VerifyPolicy::new().requirement(requirement))
+                .verify()
+        };
+
+        // Satisfied: ping is signed by Apple itself.
+        assert!(verify("anchor apple").is_ok());
+        // Signed, but not by the required identity: a real failure, not "unsigned".
+        assert!(matches!(verify("identifier \"com.example.nope\""), Err(Error::CFError(_))));
+        // Malformed requirement text.
+        assert!(matches!(verify("not a requirement ("), Err(Error::CFError(_))));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_path_with_interior_nul_rejected() {
+        assert!(matches!(
+            super::CodeSignVerifier::for_file("C:\\Windows\\explorer.exe\0.txt"),
+            Err(Error::InvalidPath)
         ));
     }
 
@@ -265,7 +388,11 @@ mod tests {
         let ctx = signed_context(path).unwrap();
         let cert = extract_leaf_certificate(path);
 
-        assert_eq!(ctx.serial(), Some(macos_cert_serial(&cert)));
+        // openssl drops the DER sign byte, so compare without leading zeros.
+        assert_eq!(
+            ctx.serial().map(|s| s.trim_start_matches('0').to_string()),
+            Some(macos_cert_serial(&cert).trim_start_matches('0').to_string())
+        );
     }
 
     #[test]
@@ -287,16 +414,53 @@ mod tests {
     // Helpers
     // ------------------------------------------------------------------
 
+    // Binaries that are always present and signed on the current platform.
+    fn signed_paths() -> Vec<String> {
+        #[cfg(target_os = "macos")]
+        return vec!["/sbin/ping".to_string()];
+        #[cfg(windows)]
+        return vec![explorer_path(), cmd_path()];
+    }
+
     fn signed_context(path: &str) -> Result<SignatureContext, Error> {
         super::CodeSignVerifier::for_file(path)?.verify()
+    }
+
+    // A leaf certificate extracted into its own temporary directory, removed on drop. Each
+    // extraction gets a unique directory since tests run concurrently within one process.
+    #[cfg(target_os = "macos")]
+    struct LeafCert(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl LeafCert {
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("cert0")
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for LeafCert {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     // Extracts the leaf signing certificate from a binary via `codesign` so tests can compare
     // against it instead of relying on hardcoded values, since Apple periodically rotates the
     // signing certificate.
     #[cfg(target_os = "macos")]
-    fn extract_leaf_certificate(path: &str) -> std::path::PathBuf {
-        let prefix = std::env::temp_dir().join(format!("verifysign-test-{}", std::process::id()));
+    fn extract_leaf_certificate(path: &str) -> LeafCert {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "verifysign-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = LeafCert(dir);
+        let prefix = cert.0.join("cert");
         let output = std::process::Command::new("codesign")
             .arg("-d")
             .arg(format!("--extract-certificates={}", prefix.display()))
@@ -309,14 +473,14 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        std::path::PathBuf::from(format!("{}0", prefix.display()))
+        cert
     }
 
     #[cfg(target_os = "macos")]
-    fn openssl_x509(cert: &std::path::Path, args: &[&str]) -> String {
+    fn openssl_x509(cert: &LeafCert, args: &[&str]) -> String {
         let output = std::process::Command::new("openssl")
             .args(["x509", "-inform", "DER", "-in"])
-            .arg(cert)
+            .arg(cert.path())
             .arg("-noout")
             .args(args)
             .output()
@@ -327,7 +491,7 @@ mod tests {
 
     // Parses a `subject= /CN=.../O=.../C=US`-style openssl name line for the given RDN key.
     #[cfg(target_os = "macos")]
-    fn macos_cert_field(cert: &std::path::Path, which: &str, key: &str) -> Option<String> {
+    fn macos_cert_field(cert: &LeafCert, which: &str, key: &str) -> Option<String> {
         let line = openssl_x509(cert, &[which]);
         let rdns = line.split_once('/')?.1;
 
@@ -338,7 +502,7 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn macos_cert_fingerprint(cert: &std::path::Path, algo: &str) -> String {
+    fn macos_cert_fingerprint(cert: &LeafCert, algo: &str) -> String {
         openssl_x509(cert, &["-fingerprint", algo])
             .rsplit('=')
             .next()
@@ -348,11 +512,10 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn macos_cert_serial(cert: &std::path::Path) -> String {
-        let hex = openssl_x509(cert, &["-serial"]);
-        let hex = hex.trim_start_matches("serial=");
-
-        u128::from_str_radix(hex, 16).unwrap().to_string()
+    fn macos_cert_serial(cert: &LeafCert) -> String {
+        openssl_x509(cert, &["-serial"])
+            .trim_start_matches("serial=")
+            .to_lowercase()
     }
 
     // explorer.exe carries an embedded Authenticode signature and should always be present.

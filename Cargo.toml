@@ -8,6 +8,9 @@ edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/I-Alzamil/verifysign"
 keywords = ["macos", "windows", "code", "signature", "authenticode"]
+categories = ["os::macos-apis", "os::windows-apis", "authentication"]
+rust-version = "1.85"
+exclude = [".github"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
@@ -24,3 +27,4 @@ windows-sys = { version = "0.61", features = [
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc", "aarch64-apple-darwin"]

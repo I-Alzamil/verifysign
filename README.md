@@ -11,7 +11,8 @@ The `verifysign` crate is an easy-to-use Rust library designed to verify the pre
   - **Issuer Name:** The entity that issued the signer's certificate.
   - **Serial Number:** The unique identifier of the signer's certificate.
   - **Thumbprint:** The cryptographic hash of the certificate in both SHA1 and SHA256.
-- **Cross-Platform Support:** Works seamlessly in both Windows and macOS.
+- **Cross-Platform Support:** Works seamlessly in both Windows and macOS, with the same output format on both.
+- **Configurable Policy:** Revocation checking, network access, strict expiration and (on macOS) custom code requirements via `VerifyPolicy`. Revocation is not checked by default.
 
 ## Use Cases
 - Verify the authenticity of downloaded files or software packages.
@@ -49,10 +50,10 @@ fn main() {
                 Err(verifysign::Error::Unsigned) => {
                     eprintln!("File {} is unsigned",&path)
                 }
-                Err(e) => eprintln!("Error: {:?}",e),
+                Err(e) => eprintln!("Error: {}",e),
             }
         }
-        Err(e) => eprintln!("Fatal Error: {:?}",e),
+        Err(e) => eprintln!("Fatal Error: {}",e),
     }
 }
 ```
@@ -61,7 +62,7 @@ fn main() {
 Add the crate to your `Cargo.toml`:
 ```toml
 [dependencies]
-verifysign = "*"
+verifysign = "1"
 ```
 
 ## License

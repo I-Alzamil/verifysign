@@ -1,196 +1,116 @@
 use super::osx::*;
-use crate::Name;
+use crate::{Name, to_hex};
 
 pub(crate) struct Context {
     cert: SecCertificate,
-    dict: CFDictionary<CFString, CFDictionary<CFString, CFType>>,
+    // The certificate's decoded values, keyed by OID. `None` if the Security framework
+    // couldn't decode them, in which case name lookups come back empty.
+    values: Option<CFDictionary>,
 }
 
-enum SecProperty {
-    Value,
-    Label,
-    Type,
+/// Wraps one of the Security framework's constant `CFStringRef` keys.
+fn key(key: CFStringRef) -> CFString {
+    unsafe { CFString::wrap_under_get_rule(key) }
 }
 
-enum SecOID {
-    SubjectName,
-    IssuerName,
-    Serial,
-
-    Country,
-    CommonName,
-    OrgUnit,
-    Org,
-}
-
-impl Into<CFString> for SecProperty {
-    fn into(self) -> CFString {
-        unsafe {
-            CFString::wrap_under_get_rule(match self {
-                SecProperty::Value => kSecPropertyKeyValue,
-                SecProperty::Label => kSecPropertyKeyLabel,
-                SecProperty::Type => kSecPropertyKeyType,
-            })
-        }
-    }
-}
-
-impl SecProperty {
-    fn to_cfstr(self) -> CFString {
-        self.into()
-    }
-}
-
-impl Into<CFString> for SecOID {
-    fn into(self) -> CFString {
-        unsafe {
-            CFString::wrap_under_get_rule(match self {
-                SecOID::SubjectName => kSecOIDX509V1SubjectName,
-                SecOID::IssuerName => kSecOIDX509V1IssuerName,
-                SecOID::Serial => kSecOIDX509V1SerialNumber,
-
-                SecOID::CommonName => kSecOIDCommonName,
-                SecOID::Country => kSecOIDCountryName,
-                SecOID::Org => kSecOIDOrganizationName,
-                SecOID::OrgUnit => kSecOIDOrganizationalUnitName,
-            })
-        }
-    }
+/// Looks up `key` in an untyped dictionary as a `T`, or `None` if it's absent or isn't a `T`.
+/// The type check matters: the values come from parsing an arbitrary certificate.
+fn lookup<T: ConcreteCFType>(dict: &CFDictionary, key: &CFString) -> Option<T> {
+    let value = dict.find(key.as_CFTypeRef())?;
+    unsafe { CFType::wrap_under_get_rule(*value as CFTypeRef) }.downcast_into()
 }
 
 impl Context {
-    pub fn new(cert: SecCertificateRef) -> Self {
+    pub fn new(cert: &SecCertificate) -> Self {
+        let values = unsafe {
+            SecCertificateCopyValues(cert.as_concrete_TypeRef(), std::ptr::null(), None)
+        };
+
         Context {
-            cert: unsafe { SecCertificate::wrap_under_get_rule(cert) },
-            dict: unsafe {
-                CFDictionary::wrap_under_create_rule(SecCertificateCopyValues(
-                    cert,
-                    std::ptr::null(),
-                    None,
-                ))
-            },
+            cert: cert.clone(),
+            values: (!values.is_null())
+                .then(|| unsafe { CFDictionary::wrap_under_create_rule(values) }),
         }
     }
 
-    fn get<T: Into<CFString>>(&self, key: T, wanted_kind: CFString) -> Option<CFType> {
-        unsafe {
-            let dict = self.dict.find(key.into())?;
-            let kind = dict.find(SecProperty::Type.to_cfstr())?;
+    /// Returns the value array of a "section" property such as the subject or issuer name.
+    fn section(&self, oid: CFStringRef) -> Option<CFArray> {
+        let property: CFDictionary = lookup(self.values.as_ref()?, &key(oid))?;
+        lookup(&property, &key(unsafe { kSecPropertyKeyValue }))
+    }
 
-            if CFString::wrap_under_get_rule(kind.as_CFTypeRef() as _) != wanted_kind {
+    /// Finds the string value labelled with `oid` among a section's entries.
+    fn section_string(section: &CFArray, oid: CFStringRef) -> Option<String> {
+        let (label_key, value_key) = unsafe {
+            (key(kSecPropertyKeyLabel), key(kSecPropertyKeyValue))
+        };
+        let wanted = key(oid);
+
+        section.iter().find_map(|entry| {
+            let entry = unsafe { CFType::wrap_under_get_rule(*entry as CFTypeRef) }
+                .downcast_into::<CFDictionary>()?;
+            let label: CFString = lookup(&entry, &label_key)?;
+
+            if label != wanted {
                 return None;
             }
-
-            let value = dict.find(SecProperty::Value.to_cfstr())?;
-            Some(CFType::wrap_under_get_rule(value.as_CFTypeRef()))
-        }
+            lookup::<CFString>(&entry, &value_key).map(|v| v.to_string())
+        })
     }
 
-    fn get_as_section<T: Into<CFString>>(&self, key: T) -> Option<CFArray> {
-        unsafe {
-            self.get(key, CFString::new("section"))
-                .map(|v| CFArray::wrap_under_get_rule(v.as_CFTypeRef() as _))
-        }
-    }
+    fn name_for_field(&self, field: CFStringRef) -> Name {
+        let Some(section) = self.section(field) else {
+            return Name::default();
+        };
+        let get = |oid| Self::section_string(&section, oid);
 
-    fn get_as_string<T: Into<CFString>>(&self, key: T) -> Option<CFString> {
-        unsafe {
-            self.get(key, CFString::new("string"))
-                .map(|v| CFString::wrap_under_get_rule(v.as_CFTypeRef() as _))
-        }
-    }
-
-    unsafe fn get_sub_value<T: Into<CFString>>(
-        values: &CFArray,
-        concrete_label: T,
-    ) -> Option<CFType> {
-        let search_label = concrete_label.into();
-
-        for value in values.iter() {
-            // Iterate over the values until we find the correct label
-            let subdict: CFDictionary<CFString, CFType> =
-                unsafe { CFDictionary::wrap_under_get_rule(*value as _) };
-
-            let label_key: CFString = SecProperty::Label.into();
-            let value_key: CFString = SecProperty::Value.into();
-
-            let label = unsafe { CFString::wrap_under_get_rule(subdict.find(label_key)?.as_CFTypeRef() as _) };
-
-            if label == search_label {
-                return subdict
-                    .find(value_key)
-                    .map(|r| unsafe { CFType::wrap_under_get_rule(r.as_CFTypeRef()) });
-            }
-        }
-        None
-    }
-
-    unsafe fn get_string<T: Into<CFString>>(values: &CFArray, concrete_label: T) -> Option<String> {
-        unsafe {Self::get_sub_value(values, concrete_label)
-            .map(|t| CFString::wrap_under_get_rule(t.as_CFTypeRef() as _).to_string())}
-    }
-
-    fn name_for_field(&self, field: SecOID) -> Name {
-        use SecOID::*;
-
-        let vals = self.get_as_section(field);
         unsafe {
             Name {
-                common_name: vals.as_ref().and_then(|a| Self::get_string(a, CommonName)),
-                country: vals.as_ref().and_then(|a| Self::get_string(a, Country)),
-                organization: vals.as_ref().and_then(|a| Self::get_string(a, Org)),
-                organization_unit: vals.as_ref().and_then(|a| Self::get_string(a, OrgUnit)),
+                common_name: get(kSecOIDCommonName),
+                country: get(kSecOIDCountryName),
+                organization: get(kSecOIDOrganizationName),
+                organization_unit: get(kSecOIDOrganizationalUnitName),
             }
         }
     }
 
     pub fn serial(&self) -> Option<String> {
-        self.get_as_string(SecOID::Serial).map(|s| s.to_string())
+        let data = unsafe { SecCertificateCopySerialNumberData(self.cert.as_concrete_TypeRef(), None) };
+        if data.is_null() {
+            return None;
+        }
+
+        let data = unsafe { CFData::wrap_under_create_rule(data) };
+        Some(to_hex(data.bytes()))
     }
 
     pub fn subject_name(&self) -> Name {
-        self.name_for_field(SecOID::SubjectName)
+        self.name_for_field(unsafe { kSecOIDX509V1SubjectName })
     }
 
     pub fn issuer_name(&self) -> Name {
-        self.name_for_field(SecOID::IssuerName)
+        self.name_for_field(unsafe { kSecOIDX509V1IssuerName })
+    }
+
+    fn cert_data(&self) -> CFData {
+        unsafe { CFData::wrap_under_create_rule(SecCertificateCopyData(self.cert.as_concrete_TypeRef())) }
     }
 
     pub fn sha1_thumbprint(&self) -> String {
-        let cert_data = unsafe {
-            CFData::wrap_under_create_rule(SecCertificateCopyData(self.cert.as_concrete_TypeRef()))
-        };
-
-        let bytes = cert_data.bytes();
+        let data = self.cert_data();
+        let bytes = data.bytes();
         let mut hash = [0u8; CC_SHA1_DIGEST_LENGTH];
-        unsafe {
-            CC_SHA1(
-                bytes.as_ptr() as *const _,
-                bytes.len() as CC_LONG,
-                hash.as_mut_ptr(),
-            );
-        }
+        unsafe { CC_SHA1(bytes.as_ptr() as *const _, bytes.len() as CC_LONG, hash.as_mut_ptr()) };
 
-        hash.iter()
-            .fold(String::new(), |s, byte| s + &format!("{:02x}", byte))
+        to_hex(&hash)
     }
 
     pub fn sha256_thumbprint(&self) -> String {
-        let cert_data = unsafe {
-            CFData::wrap_under_create_rule(SecCertificateCopyData(self.cert.as_concrete_TypeRef()))
-        };
-
-        let bytes = cert_data.bytes();
+        let data = self.cert_data();
+        let bytes = data.bytes();
         let mut hash = [0u8; CC_SHA256_DIGEST_LENGTH];
-        unsafe {
-            CC_SHA256(
-                bytes.as_ptr() as *const _,
-                bytes.len() as CC_LONG,
-                hash.as_mut_ptr(),
-            );
-        }
+        unsafe { CC_SHA256(bytes.as_ptr() as *const _, bytes.len() as CC_LONG, hash.as_mut_ptr()) };
 
-        hash.iter()
-            .fold(String::new(), |s, byte| s + &format!("{:02x}", byte))
+        to_hex(&hash)
     }
 }

@@ -1,5 +1,6 @@
 pub use core_foundation::array::{CFArray, CFArrayRef};
-pub use core_foundation::base::{CFType, CFTypeID, OSStatus, TCFType};
+pub use core_foundation::base::{CFType, CFTypeID, CFTypeRef, OSStatus, TCFType};
+pub use core_foundation::ConcreteCFType;
 pub use core_foundation::data::{CFData, CFDataRef};
 pub use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
 pub use core_foundation::error::{CFError, CFErrorRef};
@@ -52,18 +53,16 @@ declare_TCFType!(SecRequirement, SecRequirementRef);
 impl_TCFType!(SecRequirement, SecRequirementRef, SecRequirementGetTypeID);
 impl_CFTypeDescription!(SecRequirement);
 
-#[repr(u32)]
-#[allow(dead_code, non_camel_case_types, clippy::enum_variant_names)] // names mirror Apple's SecCSFlags constants
-pub enum SecCSFlags {
-    kSecCSDefaultFlags = 0,
-    kSecCSSigningInformation = 1 << 1,
-    kSecCSConsiderExpiration = 1 << 31,
-    kSecCSEnforceRevocationChecks = 1 << 30,
-    kSecCSCheckTrustedAnchors = 1 << 27,
-    kSecCSNoNetworkAccess = 1 << 29,
-    kSecCSReportProgress = 1 << 28,
-    kSecCSQuickCheck = 1 << 26,
-}
+/// Bit set of Apple's `SecCSFlags` constants, combined with `|`.
+pub type SecCSFlags = u32;
+
+pub const kSecCSDefaultFlags: SecCSFlags = 0;
+/// For universal binaries, validate every architecture instead of only the host's.
+pub const kSecCSCheckAllArchitectures: SecCSFlags = 1 << 0;
+pub const kSecCSSigningInformation: SecCSFlags = 1 << 1;
+pub const kSecCSNoNetworkAccess: SecCSFlags = 1 << 29;
+pub const kSecCSEnforceRevocationChecks: SecCSFlags = 1 << 30;
+pub const kSecCSConsiderExpiration: SecCSFlags = 1 << 31;
 
 #[allow(improper_ctypes)]
 #[cfg_attr(
@@ -113,6 +112,11 @@ unsafe extern "C" {
 
     pub unsafe fn SecCertificateCopyData(certificate: SecCertificateRef) -> CFDataRef;
 
+    pub unsafe fn SecCertificateCopySerialNumberData(
+        certificate: SecCertificateRef,
+        error: Option<&mut CFErrorRef>,
+    ) -> CFDataRef;
+
     pub unsafe fn SecCertificateCopyValues(
         certificate: SecCertificateRef,
         keys: CFArrayRef,
@@ -125,11 +129,9 @@ unsafe extern "C" {
 
     pub unsafe static kSecPropertyKeyValue: CFStringRef;
     pub unsafe static kSecPropertyKeyLabel: CFStringRef;
-    pub unsafe static kSecPropertyKeyType: CFStringRef;
 
     pub unsafe static kSecOIDX509V1SubjectName: CFStringRef;
     pub unsafe static kSecOIDX509V1IssuerName: CFStringRef;
-    pub unsafe static kSecOIDX509V1SerialNumber: CFStringRef;
 
     pub unsafe static kSecOIDCountryName: CFStringRef;
     pub unsafe static kSecOIDCommonName: CFStringRef;

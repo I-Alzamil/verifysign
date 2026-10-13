@@ -1,11 +1,21 @@
 mod context;
 mod win;
 
-use super::Error;
+use super::{Error, Revocation, VerifyPolicy};
+use context::close_data;
 use win::*;
 
-pub(crate) struct Verifier(Vec<u16>);
+pub(crate) struct Verifier {
+    path: Vec<u16>, // Null terminated
+    policy: VerifyPolicy,
+}
 pub(crate) use context::Context;
+
+/// What `WinVerifyTrust` should verify: a file's embedded signature or its catalog entry.
+enum TrustSubject {
+    File(*mut WINTRUST_FILE_INFO),
+    Catalog(*mut WINTRUST_CATALOG_INFO),
+}
 
 struct CleanupContext {
     h_file: HANDLE,
@@ -44,9 +54,17 @@ impl Verifier {
         use std::os::windows::ffi::OsStrExt;
 
         let mut path_vec: Vec<u16> = path.as_ref().as_os_str().encode_wide().collect();
+
+        // An interior null would silently truncate the path and verify a different file.
+        if path_vec.contains(&0) {
+            return Err(Error::InvalidPath);
+        }
         path_vec.push(0); // Make sure path is null terminated
 
-        Ok(Self(path_vec))
+        Ok(Self {
+            path: path_vec,
+            policy: VerifyPolicy::default(),
+        })
     }
 
     // Extract the path of a pid, then call for file
@@ -55,28 +73,40 @@ impl Verifier {
         Self::for_file(path)
     }
 
-    pub fn verify(&self) -> Result<Context, Error> {
-        unsafe {
-            let mut file_info: WINTRUST_FILE_INFO = std::mem::zeroed();
-            file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
-            file_info.pcwszFilePath = self.0.as_ptr();
+    pub fn set_policy(&mut self, policy: VerifyPolicy) {
+        self.policy = policy;
+    }
 
-            match self.verify_internal(Some(&mut file_info), None) {
-                Ok(context) => Ok(context),
-                Err(err) => {
-                    if err == TRUST_E_NOSIGNATURE as u32 {
-                        self.verify_catalog_signed()
-                    } else {
-                        Err(Error::OsError(err as i32))
-                    }
-                }
-            }
+    pub fn verify(&self) -> Result<Context, Error> {
+        let mut file_info: WINTRUST_FILE_INFO = unsafe { std::mem::zeroed() };
+        file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
+        file_info.pcwszFilePath = self.path.as_ptr();
+
+        match unsafe { self.verify_internal(TrustSubject::File(&mut file_info)) } {
+            Ok(context) => Ok(context),
+            Err(TRUST_E_NOSIGNATURE) => self.verify_catalog_signed(),
+            Err(err) => Err(Error::OsError(err)),
         }
     }
 
-    unsafe fn verify_catalog_signed(&self) -> Result<Context, Error> {
+    /// Looks the file up in the system catalogs, first by SHA256 hash and then by SHA1 hash
+    /// (which older and some third-party catalogs still use).
+    fn verify_catalog_signed(&self) -> Result<Context, Error> {
+        for algorithm in [BCRYPT_SHA256_ALGORITHM, BCRYPT_SHA1_ALGORITHM] {
+            match unsafe { self.verify_catalog_signed_with(algorithm) } {
+                Err(Error::Unsigned) => continue,
+                result => return result,
+            }
+        }
+
+        Err(Error::Unsigned)
+    }
+
+    /// Verifies the file against each catalog containing its `algorithm` hash, returning
+    /// `Error::Unsigned` if no catalog contains it.
+    unsafe fn verify_catalog_signed_with(&self, algorithm: PCWSTR) -> Result<Context, Error> {
         let h_file = unsafe { CreateFileW(
-            self.0.as_ptr(),
+            self.path.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ,
             std::ptr::null_mut(),
@@ -96,7 +126,7 @@ impl Verifier {
         let result = unsafe { CryptCATAdminAcquireContext2(
             &mut h_cat_admin,
             std::ptr::null(),
-            BCRYPT_SHA256_ALGORITHM,
+            algorithm,
             std::ptr::null(),
             0,
         ) };
@@ -107,8 +137,9 @@ impl Verifier {
 
         ctx.h_cat_admin = h_cat_admin;
 
-        let mut hash_size: u32 = 32;
-        let mut hash_buffer: Vec<u8> = vec![0; hash_size as usize];
+        // Large enough for any supported digest; the call sets hash_size to the actual length.
+        let mut hash_buffer = [0u8; 64];
+        let mut hash_size = hash_buffer.len() as u32;
         let result = unsafe { CryptCATAdminCalcHashFromFileHandle2(
             h_cat_admin,
             h_file,
@@ -120,117 +151,205 @@ impl Verifier {
             let err = unsafe { GetLastError() } as i32;
             return Err(Error::OsError(err));
         }
+        let hash_buffer = &hash_buffer[..hash_size as usize];
 
-        let h_cat_info = unsafe { CryptCATAdminEnumCatalogFromHash(
-            h_cat_admin,
-            hash_buffer.as_ptr(),
-            hash_size,
-            0,
-            std::ptr::null_mut(),
-        ) };
-        if h_cat_info == 0 {
-            return Err(Error::Unsigned);
-        }
-
-        ctx.h_cat_info = h_cat_info;
-
-        let mut ci: CATALOG_INFO = unsafe { std::mem::zeroed() };
-        ci.cbStruct = std::mem::size_of::<CATALOG_INFO>() as u32;
-
-        let result = unsafe { CryptCATCatalogInfoFromContext(h_cat_info, &mut ci, 0) };
-        if result == 0 {
-            let err = unsafe { GetLastError() } as i32;
-            return Err(Error::OsError(err));
-        }
-
-        let hash_str = hash_buffer
-            .iter()
-            .map(|&val| format!("{:02x}", val))
-            .collect::<Vec<String>>()
-            .join("");
-        let mut hash: Vec<u16> = hash_str.encode_utf16().collect();
+        let mut hash: Vec<u16> = crate::to_hex(hash_buffer).encode_utf16().collect();
         hash.push(0); // Make sure hash is null terminated
 
-        let mut wci: WINTRUST_CATALOG_INFO = unsafe { std::mem::zeroed() };
-        wci.cbStruct = std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32;
-        wci.pcwszCatalogFilePath = ci.wszCatalogFile.as_ptr();
-        wci.pcwszMemberFilePath = self.0.as_ptr();
-        wci.pcwszMemberTag = hash.as_ptr();
+        // A hash may be listed in several catalogs; accept the file if any of them verifies.
+        let mut last_err = None;
+        loop {
+            // Per the docs, each call is passed the previous call's return value to continue the
+            // enumeration, and only the context from the final call is released by the caller.
+            let prev = if ctx.h_cat_info == 0 {
+                std::ptr::null_mut()
+            } else {
+                &mut ctx.h_cat_info as *mut isize
+            };
+            let h_cat_info = unsafe { CryptCATAdminEnumCatalogFromHash(
+                h_cat_admin,
+                hash_buffer.as_ptr(),
+                hash_size,
+                0,
+                prev,
+            ) };
+            ctx.h_cat_info = h_cat_info;
+            if h_cat_info == 0 {
+                break;
+            }
 
-        match unsafe { self.verify_internal(None, Some(&mut wci)) } {
-            Ok(context) => Ok(context),
-            Err(err) => Err(Error::OsError(err as i32)),
+            let mut ci: CATALOG_INFO = unsafe { std::mem::zeroed() };
+            ci.cbStruct = std::mem::size_of::<CATALOG_INFO>() as u32;
+
+            if unsafe { CryptCATCatalogInfoFromContext(h_cat_info, &mut ci, 0) } == 0 {
+                last_err = Some(unsafe { GetLastError() } as i32);
+                continue;
+            }
+
+            let mut wci: WINTRUST_CATALOG_INFO = unsafe { std::mem::zeroed() };
+            wci.cbStruct = std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32;
+            wci.pcwszCatalogFilePath = ci.wszCatalogFile.as_ptr();
+            wci.pcwszMemberFilePath = self.path.as_ptr();
+            wci.pcwszMemberTag = hash.as_ptr();
+
+            match unsafe { self.verify_internal(TrustSubject::Catalog(&mut wci)) } {
+                Ok(context) => return Ok(context),
+                Err(err) => last_err = Some(err),
+            }
+        }
+
+        match last_err {
+            Some(err) => Err(Error::OsError(err)),
+            None => Err(Error::Unsigned),
         }
     }
 
-    unsafe fn verify_internal(
-        &self,
-        file_info: Option<*mut WINTRUST_FILE_INFO>,
-        catalog_info: Option<*mut WINTRUST_CATALOG_INFO>,
-    ) -> Result<Context, WIN32_ERROR> {
+    /// Runs `WinVerifyTrust`, returning its HRESULT status on failure.
+    unsafe fn verify_internal(&self, subject: TrustSubject) -> Result<Context, i32> {
         // Initialize the WINTRUST_DATA structure
         let mut data: WINTRUST_DATA = unsafe { std::mem::zeroed() };
         data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
         data.dwUIChoice = WTD_UI_NONE;
-        data.fdwRevocationChecks = WTD_REVOKE_NONE;
         data.dwStateAction = WTD_STATEACTION_VERIFY;
         data.dwUIContext = WTD_UICONTEXT_EXECUTE;
 
-        let common_prov_flags =
-            WTD_DISABLE_MD2_MD4 | 
-            WTD_REVOCATION_CHECK_END_CERT | 
-            WTD_CACHE_ONLY_URL_RETRIEVAL;
+        let (revocation_checks, prov_flags) = trust_flags(&self.policy);
+        data.fdwRevocationChecks = revocation_checks;
 
-        if let Some(fi) = file_info {
-            data.dwUnionChoice = WTD_CHOICE_FILE;
-            data.Anonymous.pFile = fi;
-            data.dwProvFlags = common_prov_flags | WTD_NO_IE4_CHAIN_FLAG;
-        } else if let Some(ci) = catalog_info {
-            data.dwUnionChoice = WTD_CHOICE_CATALOG;
-            data.Anonymous.pCatalog = ci;
-            data.dwProvFlags = common_prov_flags | WTD_USE_DEFAULT_OSVER_CHECK;
-        } else {
-            return Err(ERROR_INVALID_PARAMETER);
+        match subject {
+            TrustSubject::File(fi) => {
+                data.dwUnionChoice = WTD_CHOICE_FILE;
+                data.Anonymous.pFile = fi;
+                data.dwProvFlags = prov_flags | WTD_NO_IE4_CHAIN_FLAG;
+            }
+            TrustSubject::Catalog(ci) => {
+                data.dwUnionChoice = WTD_CHOICE_CATALOG;
+                data.Anonymous.pCatalog = ci;
+                data.dwProvFlags = prov_flags | WTD_USE_DEFAULT_OSVER_CHECK;
+            }
         }
 
         let mut guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
 
-        // Verify that the signature is actually valid
-        match unsafe { WinVerifyTrust(
+        // Verify that the signature is actually valid. The status is the function's return
+        // value; GetLastError isn't reliable here.
+        let status = unsafe { WinVerifyTrust(
             INVALID_HANDLE_VALUE as _,
             &mut guid,
             &mut data as *mut _ as _,
-        ) } {
-            0 => {}
-            _ => {
-                let _ = Context::new(data.hWVTStateData); // So close gets called on the data
-                return Err(unsafe { GetLastError() });
-            }
+        ) };
+
+        if status != 0 {
+            close_data(data.hWVTStateData);
+            return Err(status);
         }
 
         Context::new(data.hWVTStateData)
     }
 }
 
-/// Attempts to get the full system path for a given proccess id
-fn get_process_path(proc_id: u32) -> Result<String, Error> {
-    let mut buf = [0u16; 2048];
+/// Translates a policy into `WINTRUST_DATA`'s `fdwRevocationChecks` and the `dwProvFlags`
+/// shared by file and catalog verification.
+fn trust_flags(policy: &VerifyPolicy) -> (u32, u32) {
+    let mut prov_flags = WTD_DISABLE_MD2_MD4;
+
+    let revocation_checks = match policy.revocation {
+        Revocation::None => WTD_REVOKE_NONE,
+        Revocation::EndCertificate => {
+            prov_flags |= WTD_REVOCATION_CHECK_END_CERT;
+            WTD_REVOKE_WHOLECHAIN
+        }
+        Revocation::Chain => {
+            prov_flags |= WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+            WTD_REVOKE_WHOLECHAIN
+        }
+    };
+
+    // By default only go to the network when revocation checking needs it.
+    if !policy.allow_network.unwrap_or(policy.revocation != Revocation::None) {
+        prov_flags |= WTD_CACHE_ONLY_URL_RETRIEVAL;
+    }
+
+    if policy.strict_expiration {
+        prov_flags |= WTD_LIFETIME_SIGNING_FLAG;
+    }
+
+    (revocation_checks, prov_flags)
+}
+
+/// Attempts to get the full system path for a given process id
+fn get_process_path(proc_id: u32) -> Result<std::ffi::OsString, Error> {
+    use std::os::windows::ffi::OsStringExt;
+
+    // Longest path Windows supports (in UTF-16 units), with the \\?\ prefix.
+    const MAX_LEN: usize = 32 * 1024;
 
     unsafe {
-        let proc_handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc_id) {
-            handle if handle == std::ptr::null_mut() => return Err(Error::OsError(GetLastError() as i32)),
-            handle => handle,
-        };
+        let proc_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, proc_id);
+        if proc_handle.is_null() {
+            return Err(Error::OsError(GetLastError() as i32));
+        }
 
-        let mut path_len = buf.len() as _;
+        let mut buf = vec![0u16; 1024];
+        let result = loop {
+            let mut path_len = buf.len() as u32;
 
-        let result = match QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut path_len) {
-            0 => Err(Error::OsError(GetLastError() as i32)),
-            _ => Ok(String::from_utf16_lossy(&buf[..path_len as usize])),
+            if QueryFullProcessImageNameW(proc_handle, 0, buf.as_mut_ptr(), &mut path_len) != 0 {
+                break Ok(std::ffi::OsString::from_wide(&buf[..path_len as usize]));
+            }
+
+            let err = GetLastError();
+            if err != ERROR_INSUFFICIENT_BUFFER || buf.len() >= MAX_LEN {
+                break Err(Error::OsError(err as i32));
+            }
+            buf.resize(buf.len() * 2, 0);
         };
 
         CloseHandle(proc_handle);
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_flags() {
+        // Exactly what verification used before policies existed.
+        assert_eq!(
+            trust_flags(&VerifyPolicy::default()),
+            (WTD_REVOKE_NONE, WTD_DISABLE_MD2_MD4 | WTD_CACHE_ONLY_URL_RETRIEVAL)
+        );
+    }
+
+    #[test]
+    fn test_revocation_flags() {
+        // Revocation implies network access unless explicitly forbidden.
+        assert_eq!(
+            trust_flags(&VerifyPolicy::new().revocation(Revocation::EndCertificate)),
+            (WTD_REVOKE_WHOLECHAIN, WTD_DISABLE_MD2_MD4 | WTD_REVOCATION_CHECK_END_CERT)
+        );
+        assert_eq!(
+            trust_flags(&VerifyPolicy::new().revocation(Revocation::Chain)),
+            (WTD_REVOKE_WHOLECHAIN, WTD_DISABLE_MD2_MD4 | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT)
+        );
+    }
+
+    #[test]
+    fn test_network_flags() {
+        let offline_revocation = VerifyPolicy::new().revocation(Revocation::Chain).allow_network(false);
+        let online = VerifyPolicy::new().allow_network(true);
+
+        assert_ne!(trust_flags(&offline_revocation).1 & WTD_CACHE_ONLY_URL_RETRIEVAL, 0);
+        assert_eq!(trust_flags(&online).1 & WTD_CACHE_ONLY_URL_RETRIEVAL, 0);
+    }
+
+    #[test]
+    fn test_expiration_flags() {
+        let policy = VerifyPolicy::new().strict_expiration(true);
+
+        assert_ne!(trust_flags(&policy).1 & WTD_LIFETIME_SIGNING_FLAG, 0);
     }
 }

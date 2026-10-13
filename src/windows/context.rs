@@ -1,5 +1,5 @@
 use super::win::*;
-use crate::Name;
+use crate::{Name, to_hex};
 
 pub(crate) struct Context {
     data: HANDLE,
@@ -12,7 +12,7 @@ impl Drop for Context {
     }
 }
 
-fn close_data(handle: HANDLE) {
+pub(super) fn close_data(handle: HANDLE) {
     // Initialize the WINTRUST_DATA structure
     let mut data: WINTRUST_DATA = unsafe { std::mem::zeroed() };
     data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
@@ -35,7 +35,8 @@ fn close_data(handle: HANDLE) {
 }
 
 impl Context {
-    pub fn new(state_data: HANDLE) -> Result<Self, WIN32_ERROR> {
+    /// Takes ownership of `state_data`, closing it on drop (or on error).
+    pub fn new(state_data: HANDLE) -> Result<Self, i32> {
         let mut ret = Context {
             data: state_data,
             leaf_cert_ptr: std::ptr::null(),
@@ -43,17 +44,17 @@ impl Context {
 
         unsafe {
             let crypt_prov_data = match WTHelperProvDataFromStateData(state_data) {
-                data if data.is_null() => return Err(TRUST_E_NO_SIGNER_CERT as u32),
+                data if data.is_null() => return Err(TRUST_E_NO_SIGNER_CERT),
                 data => data,
             };
 
             let crypt_prov_sgnr = match WTHelperGetProvSignerFromChain(crypt_prov_data, 0, 0, 0) {
-                sgnr if sgnr.is_null() => return Err(TRUST_E_NO_SIGNER_CERT as u32),
+                sgnr if sgnr.is_null() => return Err(TRUST_E_NO_SIGNER_CERT),
                 sgnr => sgnr,
             };
 
             let crypt_prov_cert = match WTHelperGetProvCertFromChain(crypt_prov_sgnr, 0) {
-                cert if cert.is_null() => return Err(TRUST_E_NO_SIGNER_CERT as u32),
+                cert if cert.is_null() => return Err(TRUST_E_NO_SIGNER_CERT),
                 cert => cert,
             };
 
@@ -64,7 +65,6 @@ impl Context {
     }
 
     fn get_oid_name(&self, issuer: bool, oid: windows_sys::core::PCSTR) -> Option<String> {
-        use std::os::windows::ffi::OsStringExt;
         let flag = if issuer { CERT_NAME_ISSUER_FLAG } else { 0 };
 
         // Determine string size:
@@ -100,11 +100,8 @@ impl Context {
             return None;
         }
 
-        Some(
-            std::ffi::OsString::from_wide(&buf[..len as usize - 1])
-                .into_string()
-                .unwrap(),
-        )
+        // Lossy so a malformed name (e.g. unpaired surrogates) can't cause a panic.
+        Some(String::from_utf16_lossy(&buf[..len as usize - 1]))
     }
 
     pub fn serial(&self) -> Option<String> {
@@ -121,11 +118,9 @@ impl Context {
         let blob =
             unsafe { std::slice::from_raw_parts(serial_blob.pbData, serial_blob.cbData as usize) };
 
-        // For some reason windows stores the serial number in reverse order
-        Some(
-            blob.iter()
-                .fold(String::new(), |v, s| format!("{:02x}{}", s, v)),
-        )
+        // Windows stores the serial number little-endian; flip it to the usual big-endian form.
+        let big_endian: Vec<u8> = blob.iter().rev().copied().collect();
+        Some(to_hex(&big_endian))
     }
 
     pub fn subject_name(&self) -> Name {
@@ -157,6 +152,8 @@ impl Context {
                 &mut len,
             )
         };
+        // The hash properties are computed on demand from the encoded certificate, so this can
+        // only fail on allocation failure, which Rust treats as fatal anyway.
         assert_ne!(ok, 0, "CertGetCertificateContextProperty failed to size hash property {prop_id}");
 
         let mut buf: Vec<u8> = vec![0; len as usize];
@@ -171,8 +168,7 @@ impl Context {
         };
         assert_ne!(ok, 0, "CertGetCertificateContextProperty failed to read hash property {prop_id}");
 
-        buf.iter()
-            .fold(String::new(), |full_hash, byte| full_hash + &format!("{:02x}", byte))
+        to_hex(&buf[..len as usize])
     }
 
     pub fn sha1_thumbprint(&self) -> String {

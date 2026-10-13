@@ -2,10 +2,13 @@ mod context;
 #[allow(non_upper_case_globals)]
 mod osx;
 
-use super::Error;
+use super::{Error, Revocation, VerifyPolicy};
 use osx::*;
 
-pub(crate) struct Verifier(SecCodeKind);
+pub(crate) struct Verifier {
+    code: SecCodeKind,
+    policy: VerifyPolicy,
+}
 pub(crate) use context::Context;
 
 #[derive(Debug)]
@@ -15,6 +18,17 @@ enum SecCodeKind {
 }
 
 impl Verifier {
+    fn new(code: SecCodeKind) -> Self {
+        Verifier {
+            code,
+            policy: VerifyPolicy::default(),
+        }
+    }
+
+    pub fn set_policy(&mut self, policy: VerifyPolicy) {
+        self.policy = policy;
+    }
+
     /// Retrieve the code object for the process with the given pid
     pub fn for_pid(pid: u32) -> Result<Self, Error> {
         let mut sec: SecCodeRef = std::ptr::null_mut();
@@ -30,10 +44,10 @@ impl Verifier {
             match SecCodeCopyGuestWithAttributes(
                 std::ptr::null_mut(),
                 attributes.as_concrete_TypeRef(),
-                SecCSFlags::kSecCSDefaultFlags,
+                kSecCSDefaultFlags,
                 Some(&mut sec),
             ) {
-                osx::errSecSuccess if !sec.is_null() => Ok(Verifier(SecCodeKind::Dynamic(
+                osx::errSecSuccess if !sec.is_null() => Ok(Verifier::new(SecCodeKind::Dynamic(
                     SecCode::wrap_under_create_rule(sec),
                 ))),
                 err => Err(Error::OsError(err)),
@@ -49,10 +63,10 @@ impl Verifier {
         unsafe {
             match SecStaticCodeCreateWithPath(
                 url.as_concrete_TypeRef(),
-                SecCSFlags::kSecCSDefaultFlags,
+                kSecCSDefaultFlags,
                 Some(&mut sec),
             ) {
-                osx::errSecSuccess if !sec.is_null() => Ok(Verifier(SecCodeKind::Static(
+                osx::errSecSuccess if !sec.is_null() => Ok(Verifier::new(SecCodeKind::Static(
                     SecStaticCode::wrap_under_create_rule(sec),
                 ))),
                 err => Err(Error::OsError(err)),
@@ -61,8 +75,9 @@ impl Verifier {
     }
 
     pub fn verify(&self) -> Result<Context, Error> {
-        // "anchor trusted" is the most generic verification: it requires the signer's
-        // certificate chain to terminate in a trust anchor the system actually trusts.
+        // The default requirement, "anchor trusted", is the most generic verification: it
+        // requires the signer's certificate chain to terminate in a trust anchor the system
+        // actually trusts.
         //
         // On arm64, the linker auto-signs every binary with an ad-hoc signature (no
         // certificate at all) so the kernel will run it, so that check fails with
@@ -70,7 +85,7 @@ impl Verifier {
         // too, so behavior matches x86_64 (where an unsigned build has no signature
         // whatsoever and fails with errSecCSUnsigned directly) — a bare ad-hoc hash
         // carries no identity to report anyway.
-        if let Err(err) = self.check_validity("anchor trusted") {
+        if let Err(err) = self.check_validity(&self.policy.requirement) {
             return Err(match err {
                 Error::Unsigned => Error::Unsigned,
                 _ if self.is_adhoc_signed() => Error::Unsigned,
@@ -78,7 +93,7 @@ impl Verifier {
             });
         }
 
-        let sec_info = self.get_code_singing_info()?;
+        let sec_info = self.get_code_signing_info()?;
         let cert_key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoCertificates) };
 
         let certs_ref = sec_info
@@ -88,14 +103,14 @@ impl Verifier {
         let certs = unsafe { CFArray::<SecCertificate>::wrap_under_get_rule(*certs_ref as _) };
         let leaf_cert = certs.get(0).ok_or(Error::LeafCertNotFound)?;
 
-        Ok(Context::new(leaf_cert.as_concrete_TypeRef()))
+        Ok(Context::new(&leaf_cert))
     }
 
-    /// Retreive a dictionary of various pieces of information from a code signature.
-    fn get_code_singing_info(&self) -> Result<CFDictionary, Error> {
+    /// Retrieve a dictionary of various pieces of information from a code signature.
+    fn get_code_signing_info(&self) -> Result<CFDictionary, Error> {
         let mut dict: CFDictionaryRef = std::ptr::null_mut();
 
-        let sec = match &self.0 {
+        let sec = match &self.code {
             SecCodeKind::Static(sec) => sec.as_concrete_TypeRef(),
             SecCodeKind::Dynamic(sec) => sec.as_CFTypeRef() as _, // Dynamic will be implicitly converted to static
         };
@@ -103,7 +118,7 @@ impl Verifier {
         unsafe {
             match SecCodeCopySigningInformation(
                 sec,
-                SecCSFlags::kSecCSSigningInformation,
+                kSecCSSigningInformation,
                 Some(&mut dict),
             ) {
                 osx::errSecSuccess if !dict.is_null() => {
@@ -118,7 +133,7 @@ impl Verifier {
     /// certificate/identity attached). Returns `false` — rather than propagating an
     /// error — if the probe itself fails, so callers fall back to the original error.
     fn is_adhoc_signed(&self) -> bool {
-        let Ok(info) = self.get_code_singing_info() else {
+        let Ok(info) = self.get_code_signing_info() else {
             return false;
         };
 
@@ -142,7 +157,7 @@ impl Verifier {
         let req = unsafe {
             match SecRequirementCreateWithStringAndErrors(
                 CFString::new(requirement).as_concrete_TypeRef(),
-                SecCSFlags::kSecCSDefaultFlags,
+                kSecCSDefaultFlags,
                 Some(&mut err),
                 Some(&mut req),
             ) {
@@ -159,11 +174,11 @@ impl Verifier {
             }
         };
 
-        let status = match &self.0 {
+        let status = match &self.code {
             SecCodeKind::Static(sec) => unsafe {
                 SecStaticCodeCheckValidityWithErrors(
                     sec.as_concrete_TypeRef(),
-                    SecCSFlags::kSecCSDefaultFlags,
+                    validity_flags(&self.policy, true),
                     req.as_concrete_TypeRef(),
                     Some(&mut err),
                 )
@@ -171,7 +186,7 @@ impl Verifier {
             SecCodeKind::Dynamic(sec) => unsafe {
                 SecCodeCheckValidityWithErrors(
                     sec.as_concrete_TypeRef(),
-                    SecCSFlags::kSecCSDefaultFlags,
+                    validity_flags(&self.policy, false),
                     req.as_concrete_TypeRef(),
                     Some(&mut err),
                 )
@@ -198,6 +213,27 @@ impl Verifier {
     }
 }
 
+/// Translates a policy into the flags for a validity check of static (on-disk) code or of
+/// dynamic code (a running process).
+fn validity_flags(policy: &VerifyPolicy, is_static: bool) -> SecCSFlags {
+    let mut flags = kSecCSDefaultFlags;
+    if policy.revocation != Revocation::None {
+        flags |= kSecCSEnforceRevocationChecks;
+    }
+    if policy.strict_expiration {
+        flags |= kSecCSConsiderExpiration;
+    }
+    if policy.allow_network == Some(false) {
+        flags |= kSecCSNoNetworkAccess;
+    }
+    // Without kSecCSCheckAllArchitectures only the host's slice of a universal binary is
+    // validated, so a tampered slice for another architecture would go unnoticed.
+    if is_static && policy.all_architectures {
+        flags |= kSecCSCheckAllArchitectures;
+    }
+    flags
+}
+
 impl Error {
     /// Converts a non-null, owned `CFErrorRef` into an `Error`.
     ///
@@ -211,5 +247,57 @@ impl Error {
             let err = CFError::wrap_under_create_rule(err);
             Error::CFError(format!("{:?}", err))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_flags() {
+        let policy = VerifyPolicy::default();
+
+        assert_eq!(validity_flags(&policy, true), kSecCSCheckAllArchitectures);
+        assert_eq!(validity_flags(&policy, false), kSecCSDefaultFlags);
+    }
+
+    #[test]
+    fn test_revocation_flags() {
+        // macOS has no leaf-only mode, so both levels enforce revocation checks.
+        for revocation in [Revocation::EndCertificate, Revocation::Chain] {
+            let policy = VerifyPolicy::new().revocation(revocation);
+
+            for is_static in [true, false] {
+                assert_ne!(validity_flags(&policy, is_static) & kSecCSEnforceRevocationChecks, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_network_flags() {
+        let offline = VerifyPolicy::new().allow_network(false);
+        let online = VerifyPolicy::new().allow_network(true);
+
+        for is_static in [true, false] {
+            assert_ne!(validity_flags(&offline, is_static) & kSecCSNoNetworkAccess, 0);
+            assert_eq!(validity_flags(&online, is_static) & kSecCSNoNetworkAccess, 0);
+        }
+    }
+
+    #[test]
+    fn test_expiration_flags() {
+        let policy = VerifyPolicy::new().strict_expiration(true);
+
+        for is_static in [true, false] {
+            assert_ne!(validity_flags(&policy, is_static) & kSecCSConsiderExpiration, 0);
+        }
+    }
+
+    #[test]
+    fn test_architecture_flags() {
+        let policy = VerifyPolicy::new().check_all_architectures(false);
+
+        assert_eq!(validity_flags(&policy, true) & kSecCSCheckAllArchitectures, 0);
     }
 }
