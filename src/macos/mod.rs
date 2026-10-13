@@ -5,11 +5,18 @@ mod osx;
 use super::{Error, Revocation, VerifyPolicy};
 use osx::*;
 
+#[derive(Debug, Clone)]
 pub(crate) struct Verifier {
-    code: SecCodeKind,
     policy: VerifyPolicy,
+    requirement: SecRequirement, // Compiled from policy.requirement
 }
 pub(crate) use context::Context;
+
+// SAFETY: the only non-thread-safe field is the SecRequirement, an immutable CF object that
+// is never mutated after creation; immutable CF objects may be shared and released from any
+// thread.
+unsafe impl Send for Verifier {}
+unsafe impl Sync for Verifier {}
 
 #[derive(Debug)]
 enum SecCodeKind {
@@ -18,19 +25,127 @@ enum SecCodeKind {
 }
 
 impl Verifier {
-    fn new(code: SecCodeKind) -> Self {
-        Verifier {
-            code,
-            policy: VerifyPolicy::default(),
+    /// Compiles the policy's requirement up front, so a malformed one is reported here rather
+    /// than on every verification.
+    pub fn new(policy: VerifyPolicy) -> Result<Self, Error> {
+        let requirement = compile_requirement(&policy.requirement)?;
+
+        Ok(Verifier { policy, requirement })
+    }
+
+    pub fn policy(&self) -> &VerifyPolicy {
+        &self.policy
+    }
+
+    pub fn verify_pid(&self, pid: u32) -> Result<Context, Error> {
+        self.verify(&SecCodeKind::for_pid(pid)?)
+    }
+
+    pub fn verify_file(&self, path: &std::path::Path) -> Result<Context, Error> {
+        self.verify(&SecCodeKind::for_file(path)?)
+    }
+
+    fn verify(&self, code: &SecCodeKind) -> Result<Context, Error> {
+        // The default requirement, "anchor trusted", is the most generic verification: it
+        // requires the signer's certificate chain to terminate in a trust anchor the system
+        // actually trusts.
+        //
+        // On arm64, the linker auto-signs every binary with an ad-hoc signature (no
+        // certificate at all) so the kernel will run it, so that check fails with
+        // errSecCSReqFailed instead of errSecCSUnsigned. Treat that case as unsigned
+        // too, so behavior matches x86_64 (where an unsigned build has no signature
+        // whatsoever and fails with errSecCSUnsigned directly) — a bare ad-hoc hash
+        // carries no identity to report anyway.
+        if let Err(err) = self.check_validity(code) {
+            return Err(match err {
+                Error::Unsigned => Error::Unsigned,
+                _ if code.is_adhoc_signed() => Error::Unsigned,
+                other => other,
+            });
+        }
+
+        let sec_info = code.get_code_signing_info()?;
+        let cert_key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoCertificates) };
+
+        let certs_ref = sec_info
+            .find(cert_key.as_CFTypeRef())
+            .ok_or(Error::LeafCertNotFound)?;
+
+        let certs = unsafe { CFArray::<SecCertificate>::wrap_under_get_rule(*certs_ref as _) };
+        let leaf_cert = certs.get(0).ok_or(Error::LeafCertNotFound)?;
+
+        Ok(Context::new(&leaf_cert))
+    }
+
+    fn check_validity(&self, code: &SecCodeKind) -> Result<(), Error> {
+        let mut err: CFErrorRef = std::ptr::null_mut();
+
+        let status = match code {
+            SecCodeKind::Static(sec) => unsafe {
+                SecStaticCodeCheckValidityWithErrors(
+                    sec.as_concrete_TypeRef(),
+                    validity_flags(&self.policy, true),
+                    self.requirement.as_concrete_TypeRef(),
+                    Some(&mut err),
+                )
+            },
+            SecCodeKind::Dynamic(sec) => unsafe {
+                SecCodeCheckValidityWithErrors(
+                    sec.as_concrete_TypeRef(),
+                    validity_flags(&self.policy, false),
+                    self.requirement.as_concrete_TypeRef(),
+                    Some(&mut err),
+                )
+            },
+        };
+
+        match status {
+            osx::errSecSuccess => Ok(()),
+            osx::errSecCSUnsigned => {
+                // errors is CF_RETURNS_RETAINED: release it even though we discard its contents.
+                if !err.is_null() {
+                    drop(unsafe { CFError::wrap_under_create_rule(err) });
+                }
+                Err(Error::Unsigned)
+            }
+            status => {
+                if !err.is_null() {
+                    Err(unsafe { Error::from_cferror(err) })
+                } else {
+                    Err(Error::OsError(status))
+                }
+            }
         }
     }
+}
 
-    pub fn set_policy(&mut self, policy: VerifyPolicy) {
-        self.policy = policy;
+/// Generate a requirement object using the Apple [Code Signing Requirement Language](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html#//apple_ref/doc/uid/TP40005929-CH5-SW1)
+fn compile_requirement(requirement: &str) -> Result<SecRequirement, Error> {
+    let mut req: SecRequirementRef = std::ptr::null_mut();
+    let mut err: CFErrorRef = std::ptr::null_mut();
+
+    unsafe {
+        match SecRequirementCreateWithStringAndErrors(
+            CFString::new(requirement).as_concrete_TypeRef(),
+            kSecCSDefaultFlags,
+            Some(&mut err),
+            Some(&mut req),
+        ) {
+            osx::errSecSuccess if !req.is_null() => Ok(SecRequirement::wrap_under_create_rule(req)),
+            status => {
+                if !err.is_null() {
+                    Err(Error::from_cferror(err))
+                } else {
+                    Err(Error::OsError(status))
+                }
+            }
+        }
     }
+}
 
+impl SecCodeKind {
     /// Retrieve the code object for the process with the given pid
-    pub fn for_pid(pid: u32) -> Result<Self, Error> {
+    fn for_pid(pid: u32) -> Result<Self, Error> {
         let mut sec: SecCodeRef = std::ptr::null_mut();
 
         let attributes = unsafe {
@@ -47,18 +162,18 @@ impl Verifier {
                 kSecCSDefaultFlags,
                 Some(&mut sec),
             ) {
-                osx::errSecSuccess if !sec.is_null() => Ok(Verifier::new(SecCodeKind::Dynamic(
-                    SecCode::wrap_under_create_rule(sec),
-                ))),
+                osx::errSecSuccess if !sec.is_null() => {
+                    Ok(SecCodeKind::Dynamic(SecCode::wrap_under_create_rule(sec)))
+                }
                 err => Err(Error::OsError(err)),
             }
         }
     }
 
     /// Retrieve the code object for the file at the target location
-    pub fn for_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+    fn for_file(path: &std::path::Path) -> Result<Self, Error> {
         let mut sec: SecStaticCodeRef = std::ptr::null_mut();
-        let url = CFURL::from_path(path.as_ref(), false).ok_or(Error::InvalidPath)?;
+        let url = CFURL::from_path(path, false).ok_or(Error::InvalidPath)?;
 
         unsafe {
             match SecStaticCodeCreateWithPath(
@@ -66,51 +181,19 @@ impl Verifier {
                 kSecCSDefaultFlags,
                 Some(&mut sec),
             ) {
-                osx::errSecSuccess if !sec.is_null() => Ok(Verifier::new(SecCodeKind::Static(
-                    SecStaticCode::wrap_under_create_rule(sec),
-                ))),
+                osx::errSecSuccess if !sec.is_null() => {
+                    Ok(SecCodeKind::Static(SecStaticCode::wrap_under_create_rule(sec)))
+                }
                 err => Err(Error::OsError(err)),
             }
         }
-    }
-
-    pub fn verify(&self) -> Result<Context, Error> {
-        // The default requirement, "anchor trusted", is the most generic verification: it
-        // requires the signer's certificate chain to terminate in a trust anchor the system
-        // actually trusts.
-        //
-        // On arm64, the linker auto-signs every binary with an ad-hoc signature (no
-        // certificate at all) so the kernel will run it, so that check fails with
-        // errSecCSReqFailed instead of errSecCSUnsigned. Treat that case as unsigned
-        // too, so behavior matches x86_64 (where an unsigned build has no signature
-        // whatsoever and fails with errSecCSUnsigned directly) — a bare ad-hoc hash
-        // carries no identity to report anyway.
-        if let Err(err) = self.check_validity(&self.policy.requirement) {
-            return Err(match err {
-                Error::Unsigned => Error::Unsigned,
-                _ if self.is_adhoc_signed() => Error::Unsigned,
-                other => other,
-            });
-        }
-
-        let sec_info = self.get_code_signing_info()?;
-        let cert_key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoCertificates) };
-
-        let certs_ref = sec_info
-            .find(cert_key.as_CFTypeRef())
-            .ok_or(Error::LeafCertNotFound)?;
-
-        let certs = unsafe { CFArray::<SecCertificate>::wrap_under_get_rule(*certs_ref as _) };
-        let leaf_cert = certs.get(0).ok_or(Error::LeafCertNotFound)?;
-
-        Ok(Context::new(&leaf_cert))
     }
 
     /// Retrieve a dictionary of various pieces of information from a code signature.
     fn get_code_signing_info(&self) -> Result<CFDictionary, Error> {
         let mut dict: CFDictionaryRef = std::ptr::null_mut();
 
-        let sec = match &self.code {
+        let sec = match self {
             SecCodeKind::Static(sec) => sec.as_concrete_TypeRef(),
             SecCodeKind::Dynamic(sec) => sec.as_CFTypeRef() as _, // Dynamic will be implicitly converted to static
         };
@@ -147,69 +230,6 @@ impl Verifier {
         let flags = flags.to_i64().unwrap_or(0) as u32;
 
         flags & kSecCodeSignatureAdhoc != 0
-    }
-
-    fn check_validity(&self, requirement: &str) -> Result<(), Error> {
-        let mut req: SecRequirementRef = std::ptr::null_mut();
-        let mut err: CFErrorRef = std::ptr::null_mut();
-
-        // Generate a new requirement object using the Apple [Code Signing Requirement Language](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html#//apple_ref/doc/uid/TP40005929-CH5-SW1)
-        let req = unsafe {
-            match SecRequirementCreateWithStringAndErrors(
-                CFString::new(requirement).as_concrete_TypeRef(),
-                kSecCSDefaultFlags,
-                Some(&mut err),
-                Some(&mut req),
-            ) {
-                osx::errSecSuccess if !req.is_null() => {
-                    SecRequirement::wrap_under_create_rule(req)
-                }
-                status => {
-                    if !err.is_null() {
-                        return Err(Error::from_cferror(err));
-                    } else {
-                        return Err(Error::OsError(status));
-                    }
-                }
-            }
-        };
-
-        let status = match &self.code {
-            SecCodeKind::Static(sec) => unsafe {
-                SecStaticCodeCheckValidityWithErrors(
-                    sec.as_concrete_TypeRef(),
-                    validity_flags(&self.policy, true),
-                    req.as_concrete_TypeRef(),
-                    Some(&mut err),
-                )
-            },
-            SecCodeKind::Dynamic(sec) => unsafe {
-                SecCodeCheckValidityWithErrors(
-                    sec.as_concrete_TypeRef(),
-                    validity_flags(&self.policy, false),
-                    req.as_concrete_TypeRef(),
-                    Some(&mut err),
-                )
-            },
-        };
-
-        match status {
-            osx::errSecSuccess => Ok(()),
-            osx::errSecCSUnsigned => {
-                // errors is CF_RETURNS_RETAINED: release it even though we discard its contents.
-                if !err.is_null() {
-                    drop(unsafe { CFError::wrap_under_create_rule(err) });
-                }
-                Err(Error::Unsigned)
-            }
-            status => {
-                if !err.is_null() {
-                    Err(unsafe { Error::from_cferror(err) })
-                } else {
-                    Err(Error::OsError(status))
-                }
-            }
-        }
     }
 }
 

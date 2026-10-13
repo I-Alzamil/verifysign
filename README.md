@@ -28,35 +28,63 @@ fn main() {
     #[cfg(target_os = "macos")]
     let path = format!("/sbin/ping");
     
-    match verifysign::CodeSignVerifier::for_file(&path) {
-        Ok(valid_file) => {
-            match valid_file.verify() {
-                Ok(signature) => {
-                    println!("File {} is signed",&path);
-                    println!("Signer:");
-                    println!("- Common Name: {}",signature.subject_name().common_name.unwrap_or(format!("N/A")));
-                    println!("- Country: {}",signature.subject_name().country.unwrap_or(format!("N/A")));
-                    println!("- Organization: {}",signature.subject_name().organization.unwrap_or(format!("N/A")));
-                    println!("- Organization Unit: {}",signature.subject_name().organization_unit.unwrap_or(format!("N/A")));
-                    println!("Issuer:");
-                    println!("- Common Name: {}",signature.issuer_name().common_name.unwrap_or(format!("N/A")));
-                    println!("- Country: {}",signature.issuer_name().country.unwrap_or(format!("N/A")));
-                    println!("- Organization: {}",signature.issuer_name().organization.unwrap_or(format!("N/A")));
-                    println!("- Organization Unit: {}",signature.issuer_name().organization_unit.unwrap_or(format!("N/A")));
-                    println!("Serial: {}",signature.serial().unwrap_or(format!("N/A")));
-                    println!("SHA1 Thumbprint: {}",signature.sha1_thumbprint());
-                    println!("SHA256 Thumbprint: {}",signature.sha256_thumbprint());
-                }
-                Err(verifysign::Error::Unsigned) => {
-                    eprintln!("File {} is unsigned",&path)
-                }
-                Err(e) => eprintln!("Error: {}",e),
-            }
+    match verifysign::verify_file(&path) {
+        Ok(signature) => {
+            println!("File {} is signed",&path);
+            println!("Signer:");
+            println!("- Common Name: {}",signature.subject_name().common_name.unwrap_or(format!("N/A")));
+            println!("- Country: {}",signature.subject_name().country.unwrap_or(format!("N/A")));
+            println!("- Organization: {}",signature.subject_name().organization.unwrap_or(format!("N/A")));
+            println!("- Organization Unit: {}",signature.subject_name().organization_unit.unwrap_or(format!("N/A")));
+            println!("Issuer:");
+            println!("- Common Name: {}",signature.issuer_name().common_name.unwrap_or(format!("N/A")));
+            println!("- Country: {}",signature.issuer_name().country.unwrap_or(format!("N/A")));
+            println!("- Organization: {}",signature.issuer_name().organization.unwrap_or(format!("N/A")));
+            println!("- Organization Unit: {}",signature.issuer_name().organization_unit.unwrap_or(format!("N/A")));
+            println!("Serial: {}",signature.serial().unwrap_or(format!("N/A")));
+            println!("SHA1 Thumbprint: {}",signature.sha1_thumbprint());
+            println!("SHA256 Thumbprint: {}",signature.sha256_thumbprint());
         }
-        Err(e) => eprintln!("Fatal Error: {}",e),
+        Err(verifysign::Error::Unsigned) => {
+            eprintln!("File {} is unsigned",&path)
+        }
+        Err(e) => eprintln!("Error: {}",e),
     }
 }
 ```
+
+### Custom policy, many files
+Build a `CodeSignVerifier` once and reuse it; it can be shared between threads.
+```rust
+use verifysign::{CodeSignVerifier, Revocation, VerifyPolicy};
+
+fn main() -> Result<(), verifysign::Error> {
+    let policy = VerifyPolicy::new()
+        .revocation(Revocation::Chain)
+        .allow_network(true);
+    let verifier = CodeSignVerifier::new(policy)?;
+
+    for path in std::env::args().skip(1) {
+        match verifier.verify_file(&path) {
+            Ok(signature) => println!("{path}: signed by {:?}", signature.subject_name().common_name),
+            Err(e) => println!("{path}: {e}"),
+        }
+    }
+    Ok(())
+}
+```
+
+## Migrating to 1.0
+In 1.0, `CodeSignVerifier` holds the verification policy and is built once and reused, rather than being created for each file. The target now goes to the verify call:
+
+| Before 1.0 | 1.0 |
+|---|---|
+| `CodeSignVerifier::for_file(path)?.verify()?` | `verifysign::verify_file(path)?` |
+| `CodeSignVerifier::for_pid(pid)?.verify()?` | `verifysign::verify_pid(pid)?` |
+| `CodeSignVerifier::for_file(path)?.policy(policy).verify()?` | `CodeSignVerifier::new(policy)?.verify_file(path)?` |
+| `CodeSignVerifier::for_pid(pid)?.policy(policy).verify()?` | `CodeSignVerifier::new(policy)?.verify_pid(pid)?` |
+
+When verifying several files, create the verifier once outside the loop and call `verify_file` on it for each file. On macOS, an invalid `requirement` in the policy is now reported by `CodeSignVerifier::new` instead of by each verification. `SignatureContext` and its methods are unchanged.
 
 ## Installation
 Add the crate to your `Cargo.toml`:
@@ -66,7 +94,7 @@ verifysign = "1"
 ```
 
 ## License
-This crate is distributed under the BSD 3-Clause License, making it free to use, modify, and distribute in both open-source and commercial projects. Whether you're building secure software, auditing tools, or compliance systems, `verifysign` provides the functionality you need to ensure file integrity and authenticity with ease.
+Licensed under the [BSD 3-Clause License](LICENSE). You may use, modify and redistribute it, including in commercial and closed-source projects, provided you keep the copyright notice and license text, and do not use the authors' names to endorse derived products. It is provided "as is", without warranty of any kind.
 
 ### Credit
-This project was forked from [codesign-verify-rs](https://github.com/vkrasnov/codesign-verify-rs) in 22/02/2025 credit to Vlad Krasnov.
+This project was forked on 22 February 2025 from [codesign-verify-rs](https://github.com/vkrasnov/codesign-verify-rs) by Vlad Krasnov, which is also licensed under BSD 3-Clause.

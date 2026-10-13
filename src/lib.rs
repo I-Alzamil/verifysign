@@ -5,9 +5,9 @@
 //! signatures); on macOS it goes through the Security framework's code signing services.
 //!
 //! ```no_run
-//! use verifysign::{CodeSignVerifier, Error};
+//! use verifysign::Error;
 //!
-//! match CodeSignVerifier::for_file("/path/to/binary").and_then(|v| v.verify()) {
+//! match verifysign::verify_file("/path/to/binary") {
 //!     Ok(ctx) => println!("signed by {:?}", ctx.subject_name().common_name),
 //!     Err(Error::Unsigned) => println!("not signed"),
 //!     Err(e) => println!("verification failed: {e}"),
@@ -17,8 +17,21 @@
 //! # Policy
 //!
 //! Certificate revocation is **not** checked by default, so a file signed with a since-revoked
-//! certificate still verifies. Use a [`VerifyPolicy`] with [`CodeSignVerifier::policy`] to enable
-//! it, control network access, reject expired certificates and more.
+//! certificate still verifies. Build a [`CodeSignVerifier`] from a [`VerifyPolicy`] to enable
+//! it, control network access, reject expired certificates and more. The verifier is built once
+//! and can then verify any number of files or processes, from any thread:
+//!
+//! ```no_run
+//! use verifysign::{CodeSignVerifier, Revocation, VerifyPolicy};
+//!
+//! let verifier = CodeSignVerifier::new(VerifyPolicy::new().revocation(Revocation::Chain))?;
+//!
+//! for path in ["C:/Windows/explorer.exe", "C:/Windows/System32/cmd.exe"] {
+//!     let ctx = verifier.verify_file(path)?;
+//!     println!("{path}: signed by {:?}", ctx.subject_name().common_name);
+//! }
+//! # Ok::<(), verifysign::Error>(())
+//! ```
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -37,8 +50,12 @@ use windows::{Context, Verifier};
 compile_error!("verifysign only supports macOS and Windows targets");
 
 ///
-/// Used to verify the validity of a code signature
+/// Verifies code signatures according to a [`VerifyPolicy`].
 ///
+/// Build it once with [`new`](Self::new) (or [`default`](Self::default)) and reuse it for any
+/// number of files and processes. It is cheap to clone and can be shared between threads.
+///
+#[derive(Debug, Clone)]
 pub struct CodeSignVerifier(Verifier);
 
 ///
@@ -96,14 +113,61 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Verify the signature of a binary at a given path with the default [`VerifyPolicy`].
+///
+/// Shorthand for [`CodeSignVerifier::default().verify_file(path)`](CodeSignVerifier::verify_file);
+/// build a [`CodeSignVerifier`] instead to use another policy or to verify many files.
+pub fn verify_file<P: AsRef<std::path::Path>>(path: P) -> Result<SignatureContext, Error> {
+    CodeSignVerifier::default().verify_file(path)
+}
+
+/// Verify the signature of a running application by PID with the default [`VerifyPolicy`].
+///
+/// Shorthand for [`CodeSignVerifier::default().verify_pid(pid)`](CodeSignVerifier::verify_pid);
+/// see there for the security caveats of identifying a process by PID.
+pub fn verify_pid(pid: u32) -> Result<SignatureContext, Error> {
+    CodeSignVerifier::default().verify_pid(pid)
+}
+
 impl CodeSignVerifier {
-    /// Create a verifier for a binary at a given path.
-    /// On macOS it can be either a binary or an application package.
-    pub fn for_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Verifier::for_file(path).map(CodeSignVerifier)
+    /// Create a verifier that applies `policy` to every verification.
+    ///
+    /// # Errors
+    ///
+    /// On macOS, returns [`Error::CFError`] if the policy's
+    /// [`requirement`](VerifyPolicy::requirement) fails to parse. It never fails on Windows.
+    pub fn new(policy: VerifyPolicy) -> Result<Self, Error> {
+        Verifier::new(policy).map(CodeSignVerifier)
     }
 
-    /// Create a verifier for a running application by PID.
+    /// The policy this verifier applies.
+    pub fn policy(&self) -> &VerifyPolicy {
+        self.0.policy()
+    }
+
+    /// Verify the signature of a binary at a given path.
+    /// On macOS it can be either a binary or an application package.
+    ///
+    /// On macOS the verification uses the Security framework with the policy's requirement
+    /// (by default "anchor trusted").
+    /// On Windows the verification uses WinTrust and the `WINTRUST_ACTION_GENERIC_VERIFY_V2`
+    /// action, falling back to the system catalogs for files without an embedded signature.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use verifysign::CodeSignVerifier;
+    ///
+    /// let verifier = CodeSignVerifier::default();
+    /// verifier.verify_file("C:/Windows/explorer.exe")?;
+    /// verifier.verify_file("C:/Windows/System32/cmd.exe")?;
+    /// # Ok::<(), verifysign::Error>(())
+    /// ```
+    pub fn verify_file<P: AsRef<std::path::Path>>(&self, path: P) -> Result<SignatureContext, Error> {
+        self.0.verify_file(path.as_ref()).map(SignatureContext)
+    }
+
+    /// Verify the signature of a running application by PID.
     ///
     /// # Security
     ///
@@ -113,31 +177,15 @@ impl CodeSignVerifier {
     /// not the image actually running in memory, so a file replaced after launch is not
     /// detected. Do not rely on this alone to authenticate a peer (e.g. the other end of a
     /// pipe) in security-sensitive contexts.
-    pub fn for_pid(pid: u32) -> Result<Self, Error> {
-        Verifier::for_pid(pid).map(CodeSignVerifier)
+    pub fn verify_pid(&self, pid: u32) -> Result<SignatureContext, Error> {
+        self.0.verify_pid(pid).map(SignatureContext)
     }
+}
 
-    /// Set the policy used by [`verify`](Self::verify). Without this, [`VerifyPolicy::default()`]
-    /// is used.
-    pub fn policy(mut self, policy: VerifyPolicy) -> Self {
-        self.0.set_policy(policy);
-        self
-    }
-
-    /// Perform the verification itself, according to the [`VerifyPolicy`].
-    /// On macOS the verification uses the Security framework with the policy's requirement
-    /// (by default "anchor trusted").
-    /// On Windows the verification uses WinTrust and the `WINTRUST_ACTION_GENERIC_VERIFY_V2` action.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use verifysign::CodeSignVerifier;
-    ///
-    /// CodeSignVerifier::for_file("C:/Windows/explorer.exe").unwrap().verify().unwrap();
-    /// ```
-    pub fn verify(self) -> Result<SignatureContext, Error> {
-        self.0.verify().map(SignatureContext)
+impl Default for CodeSignVerifier {
+    /// A verifier using [`VerifyPolicy::default()`].
+    fn default() -> Self {
+        Self::new(VerifyPolicy::default()).expect("the default policy is always valid")
     }
 }
 
@@ -147,9 +195,7 @@ impl SignatureContext {
     /// # Examples
     ///
     /// ```no_run
-    /// use verifysign::CodeSignVerifier;
-    ///
-    /// let ctx = CodeSignVerifier::for_file("C:/Windows/explorer.exe").unwrap().verify().unwrap();
+    /// let ctx = verifysign::verify_file("C:/Windows/explorer.exe").unwrap();
     /// assert_eq!(
     ///    ctx.subject_name().organization.as_deref(),
     ///    Some("Microsoft Corporation")
@@ -194,7 +240,7 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Error, SignatureContext, VerifyPolicy};
+    use crate::{CodeSignVerifier, Error, SignatureContext, VerifyPolicy};
 
     // ------------------------------------------------------------------
     // 1. Detection: a signature is (or isn't) found on a binary
@@ -221,10 +267,12 @@ mod tests {
     fn test_unsigned_binary_not_detected() {
         let path = std::env::current_exe().unwrap(); // own path, always unsigned and present
 
-        assert!(matches!(
-            super::CodeSignVerifier::for_file(path).unwrap().verify(),
-            Err(Error::Unsigned)
-        ));
+        assert!(matches!(super::verify_file(path), Err(Error::Unsigned)));
+    }
+
+    #[test]
+    fn test_own_process_unsigned() {
+        assert!(matches!(super::verify_pid(std::process::id()), Err(Error::Unsigned)));
     }
 
     // ------------------------------------------------------------------
@@ -234,10 +282,10 @@ mod tests {
     #[test]
     fn test_offline_policy_accepts_signed_binary() {
         // Revocation off and no network: system binaries must still verify from local data.
-        let policy = VerifyPolicy::new().allow_network(false);
+        let verifier = CodeSignVerifier::new(VerifyPolicy::new().allow_network(false)).unwrap();
 
         for path in signed_paths() {
-            let ctx = super::CodeSignVerifier::for_file(&path).unwrap().policy(policy.clone()).verify();
+            let ctx = verifier.verify_file(&path);
             assert!(ctx.is_ok(), "{path}: {:?}", ctx.err());
         }
     }
@@ -245,37 +293,49 @@ mod tests {
     #[test]
     fn test_policy_keeps_unsigned_binary_unsigned() {
         let policy = VerifyPolicy::new().allow_network(false).strict_expiration(true);
+        let verifier = CodeSignVerifier::new(policy.clone()).unwrap();
         let path = std::env::current_exe().unwrap();
 
-        assert!(matches!(
-            super::CodeSignVerifier::for_file(path).unwrap().policy(policy).verify(),
-            Err(Error::Unsigned)
-        ));
+        assert_eq!(verifier.policy(), &policy);
+        assert!(matches!(verifier.verify_file(path), Err(Error::Unsigned)));
+    }
+
+    #[test]
+    fn test_verifier_shared_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CodeSignVerifier>();
+
+        let verifier = CodeSignVerifier::default();
+
+        std::thread::scope(|s| {
+            for path in signed_paths() {
+                let verifier = &verifier;
+                s.spawn(move || assert!(verifier.verify_file(&path).is_ok(), "{path}"));
+            }
+        });
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn test_custom_requirement() {
-        let verify = |requirement: &str| {
-            super::CodeSignVerifier::for_file("/sbin/ping")
-                .unwrap()
-                .policy(VerifyPolicy::new().requirement(requirement))
-                .verify()
-        };
+        let verifier = |requirement: &str| CodeSignVerifier::new(VerifyPolicy::new().requirement(requirement));
 
         // Satisfied: ping is signed by Apple itself.
-        assert!(verify("anchor apple").is_ok());
+        assert!(verifier("anchor apple").unwrap().verify_file("/sbin/ping").is_ok());
         // Signed, but not by the required identity: a real failure, not "unsigned".
-        assert!(matches!(verify("identifier \"com.example.nope\""), Err(Error::CFError(_))));
-        // Malformed requirement text.
-        assert!(matches!(verify("not a requirement ("), Err(Error::CFError(_))));
+        assert!(matches!(
+            verifier("identifier \"com.example.nope\"").unwrap().verify_file("/sbin/ping"),
+            Err(Error::CFError(_))
+        ));
+        // Malformed requirement text is rejected when the verifier is built.
+        assert!(matches!(verifier("not a requirement ("), Err(Error::CFError(_))));
     }
 
     #[test]
     #[cfg(windows)]
     fn test_path_with_interior_nul_rejected() {
         assert!(matches!(
-            super::CodeSignVerifier::for_file("C:\\Windows\\explorer.exe\0.txt"),
+            super::verify_file("C:\\Windows\\explorer.exe\0.txt"),
             Err(Error::InvalidPath)
         ));
     }
@@ -423,7 +483,7 @@ mod tests {
     }
 
     fn signed_context(path: &str) -> Result<SignatureContext, Error> {
-        super::CodeSignVerifier::for_file(path)?.verify()
+        super::verify_file(path)
     }
 
     // A leaf certificate extracted into its own temporary directory, removed on drop. Each

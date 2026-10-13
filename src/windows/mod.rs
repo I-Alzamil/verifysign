@@ -5,8 +5,8 @@ use super::{Error, Revocation, VerifyPolicy};
 use context::close_data;
 use win::*;
 
+#[derive(Debug, Clone)]
 pub(crate) struct Verifier {
-    path: Vec<u16>, // Null terminated
     policy: VerifyPolicy,
 }
 pub(crate) use context::Context;
@@ -50,50 +50,40 @@ impl Drop for CleanupContext {
 }
 
 impl Verifier {
-    pub fn for_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        use std::os::windows::ffi::OsStrExt;
-
-        let mut path_vec: Vec<u16> = path.as_ref().as_os_str().encode_wide().collect();
-
-        // An interior null would silently truncate the path and verify a different file.
-        if path_vec.contains(&0) {
-            return Err(Error::InvalidPath);
-        }
-        path_vec.push(0); // Make sure path is null terminated
-
-        Ok(Self {
-            path: path_vec,
-            policy: VerifyPolicy::default(),
-        })
+    // Every policy is valid on Windows; this is fallible only to match the macOS backend.
+    pub fn new(policy: VerifyPolicy) -> Result<Self, Error> {
+        Ok(Self { policy })
     }
 
-    // Extract the path of a pid, then call for file
-    pub fn for_pid(pid: u32) -> Result<Self, Error> {
-        let path = get_process_path(pid)?;
-        Self::for_file(path)
+    pub fn policy(&self) -> &VerifyPolicy {
+        &self.policy
     }
 
-    pub fn set_policy(&mut self, policy: VerifyPolicy) {
-        self.policy = policy;
-    }
+    pub fn verify_file(&self, path: &std::path::Path) -> Result<Context, Error> {
+        let path = wide_path(path)?;
 
-    pub fn verify(&self) -> Result<Context, Error> {
         let mut file_info: WINTRUST_FILE_INFO = unsafe { std::mem::zeroed() };
         file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
-        file_info.pcwszFilePath = self.path.as_ptr();
+        file_info.pcwszFilePath = path.as_ptr();
 
         match unsafe { self.verify_internal(TrustSubject::File(&mut file_info)) } {
             Ok(context) => Ok(context),
-            Err(TRUST_E_NOSIGNATURE) => self.verify_catalog_signed(),
+            Err(TRUST_E_NOSIGNATURE) => self.verify_catalog_signed(&path),
             Err(err) => Err(Error::OsError(err)),
         }
     }
 
-    /// Looks the file up in the system catalogs, first by SHA256 hash and then by SHA1 hash
-    /// (which older and some third-party catalogs still use).
-    fn verify_catalog_signed(&self) -> Result<Context, Error> {
+    // Extract the path of a pid, then verify that file
+    pub fn verify_pid(&self, pid: u32) -> Result<Context, Error> {
+        let path = get_process_path(pid)?;
+        self.verify_file(path.as_ref())
+    }
+
+    /// Looks the file at `path` (null terminated) up in the system catalogs, first by SHA256
+    /// hash and then by SHA1 hash (which older and some third-party catalogs still use).
+    fn verify_catalog_signed(&self, path: &[u16]) -> Result<Context, Error> {
         for algorithm in [BCRYPT_SHA256_ALGORITHM, BCRYPT_SHA1_ALGORITHM] {
-            match unsafe { self.verify_catalog_signed_with(algorithm) } {
+            match unsafe { self.verify_catalog_signed_with(path, algorithm) } {
                 Err(Error::Unsigned) => continue,
                 result => return result,
             }
@@ -102,11 +92,11 @@ impl Verifier {
         Err(Error::Unsigned)
     }
 
-    /// Verifies the file against each catalog containing its `algorithm` hash, returning
-    /// `Error::Unsigned` if no catalog contains it.
-    unsafe fn verify_catalog_signed_with(&self, algorithm: PCWSTR) -> Result<Context, Error> {
+    /// Verifies the file at `path` (null terminated) against each catalog containing its
+    /// `algorithm` hash, returning `Error::Unsigned` if no catalog contains it.
+    unsafe fn verify_catalog_signed_with(&self, path: &[u16], algorithm: PCWSTR) -> Result<Context, Error> {
         let h_file = unsafe { CreateFileW(
-            self.path.as_ptr(),
+            path.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ,
             std::ptr::null_mut(),
@@ -189,7 +179,7 @@ impl Verifier {
             let mut wci: WINTRUST_CATALOG_INFO = unsafe { std::mem::zeroed() };
             wci.cbStruct = std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32;
             wci.pcwszCatalogFilePath = ci.wszCatalogFile.as_ptr();
-            wci.pcwszMemberFilePath = self.path.as_ptr();
+            wci.pcwszMemberFilePath = path.as_ptr();
             wci.pcwszMemberTag = hash.as_ptr();
 
             match unsafe { self.verify_internal(TrustSubject::Catalog(&mut wci)) } {
@@ -275,6 +265,21 @@ fn trust_flags(policy: &VerifyPolicy) -> (u32, u32) {
     }
 
     (revocation_checks, prov_flags)
+}
+
+/// Encodes `path` as a null terminated UTF-16 string for the Win32 APIs.
+fn wide_path(path: &std::path::Path) -> Result<Vec<u16>, Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+
+    // An interior null would silently truncate the path and verify a different file.
+    if wide.contains(&0) {
+        return Err(Error::InvalidPath);
+    }
+    wide.push(0);
+
+    Ok(wide)
 }
 
 /// Attempts to get the full system path for a given process id

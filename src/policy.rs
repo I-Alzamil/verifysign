@@ -16,8 +16,9 @@ pub enum Revocation {
 
 /// Settings that control how a signature is verified.
 ///
-/// [`VerifyPolicy::default()`] is what [`CodeSignVerifier::verify`](crate::CodeSignVerifier::verify)
-/// uses when no policy is given:
+/// Pass it to [`CodeSignVerifier::new`](crate::CodeSignVerifier::new).
+/// [`VerifyPolicy::default()`] is what [`CodeSignVerifier::default()`](crate::CodeSignVerifier::default)
+/// and the [`verify_file`](crate::verify_file) / [`verify_pid`](crate::verify_pid) shorthands use:
 ///
 /// - revocation is not checked
 /// - network access is left to the platform (see [`VerifyPolicy::allow_network`])
@@ -32,9 +33,8 @@ pub enum Revocation {
 ///     .revocation(Revocation::Chain)
 ///     .allow_network(true);
 ///
-/// let _ctx = CodeSignVerifier::for_file("C:/Windows/explorer.exe")?
-///     .policy(policy)
-///     .verify()?;
+/// let verifier = CodeSignVerifier::new(policy)?;
+/// let _ctx = verifier.verify_file("C:/Windows/explorer.exe")?;
 /// # Ok::<(), verifysign::Error>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +101,8 @@ impl VerifyPolicy {
     /// Defaults to `anchor trusted`. For example `anchor apple generic and certificate
     /// leaf[subject.OU] = "TEAMID1234"` pins a specific developer team.
     ///
-    /// A requirement that fails to parse makes verification return [`Error::CFError`](crate::Error::CFError).
+    /// A requirement that fails to parse makes [`CodeSignVerifier::new`](crate::CodeSignVerifier::new)
+    /// return [`Error::CFError`](crate::Error::CFError).
     #[cfg(target_os = "macos")]
     pub fn requirement(mut self, requirement: impl Into<String>) -> Self {
         self.requirement = requirement.into();
