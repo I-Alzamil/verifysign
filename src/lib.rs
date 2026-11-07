@@ -485,6 +485,62 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn test_sha1_catalog_policy() {
+        // Current Windows catalogs list files by SHA-256, so the SHA-1 lookup must not change
+        // the verdict for system files or for unsigned ones, only the cost for the latter.
+        let with_sha1 = CodeSignVerifier::new(VerifyPolicy::new().sha1_catalogs(true)).unwrap();
+        let default = CodeSignVerifier::default();
+
+        for path in signed_paths() {
+            assert_eq!(
+                with_sha1.verify_file(&path).unwrap().sha256_thumbprint(),
+                default.verify_file(&path).unwrap().sha256_thumbprint(),
+                "{path}"
+            );
+        }
+
+        let dir = TempDir::new();
+        let text = dir.0.join("unsigned.txt");
+        std::fs::write(&text, "not signed").unwrap();
+        assert!(matches!(with_sha1.verify_file(&text), Err(Error::Unsigned)));
+        assert!(matches!(with_sha1.verify_file(std::env::current_exe().unwrap()), Err(Error::Unsigned)));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_context_outlives_verifier() {
+        // A catalog verification borrows a lookup context and the open file from the verifier.
+        // The results must stay readable after the verifier, and other results, are gone.
+        let verifier = CodeSignVerifier::default();
+        let inf = format!("{}\\INF\\machine.inf", std::env::var("windir").unwrap());
+        let first = verifier.verify_file(cmd_path()).unwrap();
+        let second = verifier.verify_file(&inf).unwrap();
+        drop(verifier);
+        drop(first);
+
+        assert_eq!(second.subject_name().organization.as_deref(), Some("Microsoft Corporation"));
+        assert_eq!(second.sha256_thumbprint().len(), 64);
+        assert!(second.serial().is_some());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_catalog_signed_file_verifies_while_result_is_held() {
+        // The file handle a result keeps open must not block a second verification of the
+        // same file, nor a rename of it.
+        let dir = TempDir::new();
+        let copy = dir.0.join("cmd.exe");
+        std::fs::copy(cmd_path(), &copy).unwrap();
+
+        let held = super::verify_file(&copy).unwrap();
+        let again = super::verify_file(&copy).unwrap();
+        assert_eq!(held.sha256_thumbprint(), again.sha256_thumbprint());
+
+        std::fs::rename(&copy, dir.0.join("renamed.exe")).unwrap();
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn test_custom_requirement() {
         let verifier = |requirement: &str| CodeSignVerifier::new(VerifyPolicy::new().requirement(requirement));

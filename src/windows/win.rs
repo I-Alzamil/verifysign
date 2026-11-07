@@ -5,13 +5,13 @@ pub use windows_sys::Win32::{
         HANDLE,
         CloseHandle,
         GetLastError,
-        GENERIC_READ,
+        ERROR_OPEN_FAILED,
         TRUST_E_NOSIGNATURE,
         INVALID_HANDLE_VALUE,
         TRUST_E_NO_SIGNER_CERT,
         TRUST_E_SUBJECT_FORM_UNKNOWN,
         ERROR_INSUFFICIENT_BUFFER,
-    }, 
+    },
     Security::{
         WinTrust::{
             WTD_UI_NONE,
@@ -64,8 +64,6 @@ pub use windows_sys::Win32::{
         },
     },
     Storage::FileSystem::{
-        CreateFileW,
-        OPEN_EXISTING,
         FILE_SHARE_READ,
         FILE_SHARE_DELETE,
     },

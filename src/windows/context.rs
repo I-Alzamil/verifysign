@@ -4,11 +4,16 @@ use crate::{Name, to_hex};
 pub(crate) struct Context {
     data: HANDLE,
     leaf_cert_ptr: *const CERT_CONTEXT,
+    /// For a catalog verification, the file handle and catalog administrator context the
+    /// state data was created with. Dropped after the state is closed (fields drop after
+    /// `Drop::drop` runs).
+    catalog_resources: Option<super::CatalogResources>,
 }
 
 // SAFETY: the Context exclusively owns the WinTrust state data, which has no thread affinity
 // and is closed exactly once, on drop. The leaf certificate belongs to that state and is only
-// read through CryptoAPI certificate functions, which are safe to call concurrently.
+// read through CryptoAPI certificate functions, which are safe to call concurrently. The
+// catalog resources are plain handles owned by this Context alone.
 unsafe impl Send for Context {}
 unsafe impl Sync for Context {}
 
@@ -46,6 +51,7 @@ impl Context {
         let mut ret = Context {
             data: state_data,
             leaf_cert_ptr: std::ptr::null(),
+            catalog_resources: None,
         };
 
         unsafe {
@@ -74,6 +80,12 @@ impl Context {
         }
 
         Ok(ret)
+    }
+
+    /// Keeps `resources` alive for as long as the state data is open.
+    pub(super) fn with_catalog_resources(mut self, resources: super::CatalogResources) -> Self {
+        self.catalog_resources = Some(resources);
+        self
     }
 
     fn get_oid_name(&self, issuer: bool, oid: windows_sys::core::PCSTR) -> Option<String> {

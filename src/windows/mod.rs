@@ -1,6 +1,8 @@
 mod context;
 mod win;
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use super::{Error, Revocation, VerifyPolicy};
 use context::close_data;
 use win::*;
@@ -8,6 +10,7 @@ use win::*;
 #[derive(Debug, Clone)]
 pub(crate) struct Verifier {
     policy: VerifyPolicy,
+    catalog_admins: Arc<CatalogAdmins>,
 }
 pub(crate) use context::Context;
 
@@ -17,42 +20,164 @@ enum TrustSubject {
     Catalog(*mut WINTRUST_CATALOG_INFO),
 }
 
-struct CleanupContext {
-    h_file: HANDLE,
-    h_cat_admin: isize,
-    h_cat_info: isize,
+/// The hash a file is looked up by in the catalog database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogHash {
+    Sha256,
+    Sha1,
 }
 
-impl CleanupContext {
-    pub fn new(h_file: HANDLE) -> Self {
-        CleanupContext {
-            h_file,
-            h_cat_admin: 0,
-            h_cat_info: 0,
+impl CatalogHash {
+    fn algorithm(self) -> PCWSTR {
+        match self {
+            CatalogHash::Sha256 => BCRYPT_SHA256_ALGORITHM,
+            CatalogHash::Sha1 => BCRYPT_SHA1_ALGORITHM,
         }
     }
 }
 
-impl Drop for CleanupContext {
+/// Catalog administrator contexts (`HCATADMIN`) kept for the verifier's lifetime.
+///
+/// Acquiring a context is cheap, but a context that has already looked files up has the
+/// catalog database warm, which makes the next lookup several times faster. A context is used
+/// by one verification at a time, so a verifier shared between threads holds up to one per
+/// concurrent verification.
+#[derive(Debug, Default)]
+struct CatalogAdmins {
+    sha256: Mutex<Vec<isize>>,
+    sha1: Mutex<Vec<isize>>,
+}
+
+impl CatalogAdmins {
+    fn pool(&self, hash: CatalogHash) -> &Mutex<Vec<isize>> {
+        match hash {
+            CatalogHash::Sha256 => &self.sha256,
+            CatalogHash::Sha1 => &self.sha1,
+        }
+    }
+
+    /// Takes an idle context from the pool, or acquires a new one.
+    fn acquire(self: &Arc<Self>, hash: CatalogHash) -> Result<CatalogAdmin, Error> {
+        let pooled = self.pool(hash).lock().unwrap_or_else(PoisonError::into_inner).pop();
+
+        let handle = match pooled {
+            Some(handle) => handle,
+            None => {
+                let mut handle: isize = 0;
+                let result = unsafe { CryptCATAdminAcquireContext2(
+                    &mut handle,
+                    std::ptr::null(),
+                    hash.algorithm(),
+                    std::ptr::null(),
+                    0,
+                ) };
+                if result == 0 {
+                    return Err(Error::OsError(last_error()));
+                }
+                handle
+            }
+        };
+
+        Ok(CatalogAdmin { admins: Arc::clone(self), hash, handle })
+    }
+}
+
+impl Drop for CatalogAdmins {
     fn drop(&mut self) {
-        if !self.h_file.is_null() {
-            unsafe { CloseHandle(self.h_file) };
-        }
-
-        if self.h_cat_info != 0 {
-            unsafe { CryptCATAdminReleaseCatalogContext(self.h_cat_admin, self.h_cat_info, 0) };
-        }
-
-        if self.h_cat_admin != 0 {
-            unsafe { CryptCATAdminReleaseContext(self.h_cat_admin, 0) };
+        for pool in [&self.sha256, &self.sha1] {
+            for handle in pool.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
+                unsafe { CryptCATAdminReleaseContext(handle, 0) };
+            }
         }
     }
+}
+
+/// A catalog administrator context borrowed from a [`CatalogAdmins`] pool, returned on drop.
+///
+/// It keeps the pool alive, so a context referenced by open WinTrust state data is neither
+/// released nor used by another verification until that state is closed.
+pub(super) struct CatalogAdmin {
+    admins: Arc<CatalogAdmins>,
+    hash: CatalogHash,
+    handle: isize,
+}
+
+impl Drop for CatalogAdmin {
+    fn drop(&mut self) {
+        self.admins.pool(self.hash).lock().unwrap_or_else(PoisonError::into_inner).push(self.handle);
+    }
+}
+
+/// The file being verified, open for reading; closed on drop.
+pub(super) struct FileHandle(std::fs::File);
+
+impl FileHandle {
+    /// Opens the file at `path` for reading, returning the HRESULT of a failure.
+    fn open(path: &std::path::Path) -> Result<Self, i32> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            // Allow others to read, rename or delete the file meanwhile, but not to write it
+            // while it is being hashed.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+            .open(path)
+            .map(FileHandle)
+            .map_err(|err| hresult_from_win32(err.raw_os_error().unwrap_or(ERROR_OPEN_FAILED as i32) as u32))
+    }
+
+    fn handle(&self) -> HANDLE {
+        use std::os::windows::io::AsRawHandle;
+
+        self.0.as_raw_handle() as HANDLE
+    }
+
+    /// Whether the file starts with the `MZ` magic of a PE image. Leaves the file position at
+    /// the start of the file.
+    fn is_pe(&self) -> bool {
+        use std::io::Read;
+
+        let mut magic = [0u8; 2];
+        let is_pe = (&self.0).read_exact(&mut magic).is_ok() && &magic == b"MZ";
+        self.rewind();
+
+        is_pe
+    }
+
+    fn rewind(&self) {
+        use std::io::Seek;
+
+        let _ = (&self.0).seek(std::io::SeekFrom::Start(0));
+    }
+}
+
+/// A catalog context from `CryptCATAdminEnumCatalogFromHash`, released on drop.
+struct CatalogContext<'a> {
+    admin: &'a CatalogAdmin,
+    handle: isize,
+}
+
+impl Drop for CatalogContext<'_> {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe { CryptCATAdminReleaseCatalogContext(self.admin.handle, self.handle, 0) };
+        }
+    }
+}
+
+/// Everything a catalog verification's WinTrust state data may still refer to, kept alive by
+/// the [`Context`] until that state is closed.
+pub(super) struct CatalogResources {
+    #[allow(dead_code)]
+    file: FileHandle,
+    #[allow(dead_code)]
+    admin: CatalogAdmin,
 }
 
 impl Verifier {
     // Every policy is valid on Windows; this is fallible only to match the macOS backend.
     pub fn new(policy: VerifyPolicy) -> Result<Self, Error> {
-        Ok(Self { policy })
+        Ok(Self { policy, catalog_admins: Arc::default() })
     }
 
     pub fn policy(&self) -> &VerifyPolicy {
@@ -60,18 +185,61 @@ impl Verifier {
     }
 
     pub fn verify_file(&self, path: &std::path::Path) -> Result<Context, Error> {
-        let path = wide_path(path)?;
+        let wide = wide_path(path)?;
 
-        let mut file_info: WINTRUST_FILE_INFO = unsafe { std::mem::zeroed() };
-        file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
-        file_info.pcwszFilePath = path.as_ptr();
+        let file = match FileHandle::open(path) {
+            Ok(file) => file,
+            // Let WinVerifyTrust report the error it would have given for this file (e.g.
+            // CRYPT_E_FILE_ERROR for a missing one), falling back to the open error.
+            Err(open_err) => {
+                return match unsafe { self.verify_embedded(&wide) } {
+                    Ok(context) => Ok(context),
+                    Err(TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN) => Err(Error::OsError(open_err)),
+                    Err(err) => Err(Error::OsError(err)),
+                };
+            }
+        };
 
-        match unsafe { self.verify_internal(TrustSubject::File(&mut file_info)) } {
-            Ok(context) => Ok(context),
-            // No embedded signature, or a file type that can't embed one (e.g. .inf): it may
-            // still be signed through a system catalog.
-            Err(TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN) => self.verify_catalog_signed(&path),
-            Err(err) => Err(Error::OsError(err)),
+        if file.is_pe() {
+            // A PE file usually carries its signature, and finding out that it doesn't is
+            // cheap, so look there first.
+            match unsafe { self.verify_embedded(&wide) } {
+                Ok(context) => return Ok(context),
+                // No embedded signature: it may still be signed through a system catalog.
+                Err(TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN) => {}
+                Err(err) => return Err(Error::OsError(err)),
+            }
+
+            return self.verify_catalog_signed(path, &wide, file, true);
+        }
+
+        // For any other file type, finding out whether it can carry an embedded signature at
+        // all takes WinTrust several milliseconds, while a catalog lookup takes about one, and
+        // most signed non-PE files (.inf, .xml, .mui, ...) are catalog signed. So the catalog
+        // comes first, and the embedded signature is only looked for when no catalog lists
+        // the file.
+        let catalog_err = match self.verify_catalog_signed(path, &wide, file, false) {
+            Ok(context) => return Ok(context),
+            Err(Error::Unsigned) => None,
+            Err(err) => Some(err),
+        };
+
+        match unsafe { self.verify_embedded(&wide) } {
+            Ok(context) => return Ok(context),
+            Err(TRUST_E_NOSIGNATURE | TRUST_E_SUBJECT_FORM_UNKNOWN) => {}
+            Err(err) => return Err(Error::OsError(err)),
+        }
+
+        if let Some(err) = catalog_err {
+            return Err(err);
+        }
+
+        // The SHA-256 lookup already missed, so only the SHA-1 one is left.
+        if self.policy.sha1_catalogs {
+            let file = FileHandle::open(path).map_err(Error::OsError)?;
+            self.verify_catalog_signed_with(&wide, file, CatalogHash::Sha1)
+        } else {
+            Err(Error::Unsigned)
         }
     }
 
@@ -81,101 +249,79 @@ impl Verifier {
         self.verify_file(path.as_ref())
     }
 
-    /// Looks the file at `path` (null terminated) up in the system catalogs, first by SHA256
-    /// hash and then by SHA1 hash (which older and some third-party catalogs still use).
-    fn verify_catalog_signed(&self, path: &[u16]) -> Result<Context, Error> {
-        for algorithm in [BCRYPT_SHA256_ALGORITHM, BCRYPT_SHA1_ALGORITHM] {
-            match unsafe { self.verify_catalog_signed_with(path, algorithm) } {
-                Err(Error::Unsigned) => continue,
-                result => return result,
-            }
-        }
+    /// Verifies the embedded signature of the file at `path` (null terminated).
+    unsafe fn verify_embedded(&self, path: &[u16]) -> Result<Context, i32> {
+        let mut file_info: WINTRUST_FILE_INFO = unsafe { std::mem::zeroed() };
+        file_info.cbStruct = std::mem::size_of::<WINTRUST_FILE_INFO>() as u32;
+        file_info.pcwszFilePath = path.as_ptr();
 
-        Err(Error::Unsigned)
+        unsafe { self.verify_internal(TrustSubject::File(&mut file_info)) }
     }
 
-    /// Verifies the file at `path` (null terminated) against each catalog containing its
-    /// `algorithm` hash, returning `Error::Unsigned` if no catalog contains it.
-    unsafe fn verify_catalog_signed_with(&self, path: &[u16], algorithm: PCWSTR) -> Result<Context, Error> {
-        let h_file = unsafe { CreateFileW(
-            path.as_ptr(),
-            GENERIC_READ,
-            // Allow others to read, rename or delete the file meanwhile, but not to write it
-            // while it is being hashed.
-            FILE_SHARE_READ | FILE_SHARE_DELETE,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        ) };
-
-        if h_file == INVALID_HANDLE_VALUE {
-            let err = last_error();
-            return Err(Error::OsError(err));
+    /// Looks `file` (opened from `path`, also given null terminated as `wide`) up in the
+    /// system catalogs by SHA-256 hash and, if `with_sha1` and the policy allow it, by SHA-1
+    /// hash.
+    fn verify_catalog_signed(&self, path: &std::path::Path, wide: &[u16], file: FileHandle, with_sha1: bool) -> Result<Context, Error> {
+        match self.verify_catalog_signed_with(wide, file, CatalogHash::Sha256) {
+            Err(Error::Unsigned) if with_sha1 && self.policy.sha1_catalogs => {}
+            result => return result,
         }
 
-        let mut ctx = CleanupContext::new(h_file);
+        // The SHA-256 lookup took the file handle with it (it may live on in a result).
+        let file = FileHandle::open(path).map_err(Error::OsError)?;
+        self.verify_catalog_signed_with(wide, file, CatalogHash::Sha1)
+    }
 
-        let mut h_cat_admin: isize = 0;
-        let result = unsafe { CryptCATAdminAcquireContext2(
-            &mut h_cat_admin,
-            std::ptr::null(),
-            algorithm,
-            std::ptr::null(),
-            0,
-        ) };
-        if result == 0 {
-            let err = last_error();
-            return Err(Error::OsError(err));
-        }
-
-        ctx.h_cat_admin = h_cat_admin;
+    /// Verifies `file` (opened from `path`, null terminated) against each catalog containing
+    /// its `hash`, returning `Error::Unsigned` if no catalog contains it.
+    fn verify_catalog_signed_with(&self, path: &[u16], file: FileHandle, hash: CatalogHash) -> Result<Context, Error> {
+        let admin = self.catalog_admins.acquire(hash)?;
 
         // Large enough for any supported digest; the call sets hash_size to the actual length.
         let mut hash_buffer = [0u8; 64];
         let mut hash_size = hash_buffer.len() as u32;
+        file.rewind();
         let result = unsafe { CryptCATAdminCalcHashFromFileHandle2(
-            h_cat_admin,
-            h_file,
+            admin.handle,
+            file.handle(),
             &mut hash_size,
             hash_buffer.as_mut_ptr(),
             0,
         ) };
         if result == 0 {
-            let err = last_error();
-            return Err(Error::OsError(err));
+            return Err(Error::OsError(last_error()));
         }
-        let hash_buffer = &hash_buffer[..hash_size as usize];
+        let hash_buffer = &mut hash_buffer[..hash_size as usize];
 
-        let mut hash: Vec<u16> = crate::to_hex(hash_buffer).encode_utf16().collect();
-        hash.push(0); // Make sure hash is null terminated
+        let mut tag: Vec<u16> = crate::to_hex(hash_buffer).encode_utf16().collect();
+        tag.push(0); // Make sure the member tag is null terminated
 
         // A hash may be listed in several catalogs; accept the file if any of them verifies.
+        let mut catalog = CatalogContext { admin: &admin, handle: 0 };
         let mut last_err = None;
         loop {
             // Per the docs, each call is passed the previous call's return value to continue the
             // enumeration, and only the context from the final call is released by the caller.
-            let prev = if ctx.h_cat_info == 0 {
+            let prev = if catalog.handle == 0 {
                 std::ptr::null_mut()
             } else {
-                &mut ctx.h_cat_info as *mut isize
+                &mut catalog.handle as *mut isize
             };
-            let h_cat_info = unsafe { CryptCATAdminEnumCatalogFromHash(
-                h_cat_admin,
+            catalog.handle = unsafe { CryptCATAdminEnumCatalogFromHash(
+                admin.handle,
                 hash_buffer.as_ptr(),
                 hash_size,
                 0,
                 prev,
             ) };
-            ctx.h_cat_info = h_cat_info;
-            if h_cat_info == 0 {
+            if catalog.handle == 0 {
                 break;
             }
 
             let mut ci: CATALOG_INFO = unsafe { std::mem::zeroed() };
             ci.cbStruct = std::mem::size_of::<CATALOG_INFO>() as u32;
 
-            if unsafe { CryptCATCatalogInfoFromContext(h_cat_info, &mut ci, 0) } == 0 {
+            if unsafe { CryptCATCatalogInfoFromContext(catalog.handle, &mut ci, 0) } == 0 {
                 last_err = Some(last_error());
                 continue;
             }
@@ -184,10 +330,20 @@ impl Verifier {
             wci.cbStruct = std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32;
             wci.pcwszCatalogFilePath = ci.wszCatalogFile.as_ptr();
             wci.pcwszMemberFilePath = path.as_ptr();
-            wci.pcwszMemberTag = hash.as_ptr();
+            wci.pcwszMemberTag = tag.as_ptr();
+            // Hand over the open file and its hash so WinTrust doesn't reopen and rehash it.
+            // The hash is only accepted together with the context that computed it.
+            wci.hMemberFile = file.handle();
+            wci.pbCalculatedFileHash = hash_buffer.as_mut_ptr();
+            wci.cbCalculatedFileHash = hash_size;
+            wci.hCatAdmin = admin.handle;
 
+            file.rewind();
             match unsafe { self.verify_internal(TrustSubject::Catalog(&mut wci)) } {
-                Ok(context) => return Ok(context),
+                Ok(context) => {
+                    drop(catalog);
+                    return Ok(context.with_catalog_resources(CatalogResources { file, admin }));
+                }
                 Err(err) => last_err = Some(err),
             }
         }
@@ -385,5 +541,54 @@ mod tests {
         let policy = VerifyPolicy::new().strict_expiration(true);
 
         assert_ne!(trust_flags(&policy).1 & WTD_LIFETIME_SIGNING_FLAG, 0);
+    }
+
+    #[test]
+    fn test_catalog_admin_pool_reuses_contexts() {
+        let admins: Arc<CatalogAdmins> = Arc::default();
+        let pool_len = |hash| admins.pool(hash).lock().unwrap().len();
+
+        // Nothing is acquired until it is needed, and a returned context is kept for reuse.
+        assert_eq!(pool_len(CatalogHash::Sha256), 0);
+        let first = admins.acquire(CatalogHash::Sha256).unwrap();
+        let handle = first.handle;
+        assert_ne!(handle, 0);
+        drop(first);
+        assert_eq!(pool_len(CatalogHash::Sha256), 1);
+
+        let second = admins.acquire(CatalogHash::Sha256).unwrap();
+        assert_eq!(second.handle, handle);
+        assert_eq!(pool_len(CatalogHash::Sha256), 0);
+
+        // A concurrent borrower gets its own context; both go back to the pool.
+        let third = admins.acquire(CatalogHash::Sha256).unwrap();
+        assert_ne!(third.handle, handle);
+        drop((second, third));
+        assert_eq!(pool_len(CatalogHash::Sha256), 2);
+
+        // The pools are per algorithm.
+        let sha1 = admins.acquire(CatalogHash::Sha1).unwrap();
+        assert_eq!(pool_len(CatalogHash::Sha256), 2);
+        drop(sha1);
+        assert_eq!(pool_len(CatalogHash::Sha1), 1);
+    }
+
+    #[test]
+    fn test_pe_detection() {
+        let dir = std::env::temp_dir().join(format!("verifysign-pe-detection-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let check = |name: &str, content: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            FileHandle::open(&path).unwrap().is_pe()
+        };
+
+        assert!(check("exe.bin", b"MZ\x90\x00 rest of the image"));
+        assert!(!check("text.txt", b"the MZ magic is not at the start"));
+        assert!(!check("short.bin", b"M"));
+        assert!(!check("empty.bin", b""));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

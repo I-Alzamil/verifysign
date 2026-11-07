@@ -114,6 +114,7 @@ let policy = VerifyPolicy::new()
 | `revocation(Revocation)` | `None` | Check certificates for revocation: `EndCertificate` (signing certificate only) or `Chain` (all but the root). macOS has no leaf-only mode, so `EndCertificate` behaves like `Chain`. |
 | `allow_network(bool)` | platform decides | Allow or forbid network access, for example to fetch revocation lists. On Windows the network is used by default only when revocation is checked; on macOS the Security framework decides. |
 | `strict_expiration(bool)` | `false` | Reject expired certificates even if the file was timestamped while they were valid. Many OS-supplied Windows files are signed with since-expired certificates, so this rejects them. |
+| `sha1_catalogs(bool)` (Windows) | `false` | Also search the system catalogs by SHA-1 hash. Windows still accepts catalogs that list files by SHA-1 only (pre-2016 driver packages), but a SHA-1 match is weak evidence, so by default their files are reported as `Unsigned`. Turning it on costs an extra hash and lookup per unsigned file. |
 | `requirement(&str)` (macOS) | `anchor trusted` | The [code requirement](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html) the signature must satisfy. |
 | `check_all_architectures(bool)` (macOS) | `true` | Validate every architecture of a universal binary, not just the host's. |
 
@@ -121,7 +122,7 @@ let policy = VerifyPolicy::new()
 
 ## Platform behavior
 
-**Windows** uses `WinVerifyTrust` with `WINTRUST_ACTION_GENERIC_VERIFY_V2`. If a file has no embedded signature, or is a type that can't embed one (such as `.inf`), it is looked up in the system catalogs by SHA-256 and then SHA-1 hash. A process is verified through the executable file it was started from.
+**Windows** uses `WinVerifyTrust` with `WINTRUST_ACTION_GENERIC_VERIFY_V2`. A PE file (`MZ` header) is checked for an embedded signature first and, if it has none, looked up in the system catalogs by SHA-256 hash (and by SHA-1 hash if the policy enables it). Any other file is looked up in the catalogs first, since most signed data files (such as `.inf`) are catalog signed and detecting an embedded signature on them is slow; the embedded signature is only checked when no catalog lists the file. When a file is listed in several catalogs, which one is reported is unspecified. A process is verified through the executable file it was started from.
 
 **macOS** uses the Security framework's code signing services and works with both binaries and application bundles. On Apple Silicon the linker gives every binary an ad-hoc signature, which carries no certificate; such binaries are reported as `Unsigned`.
 
@@ -139,6 +140,12 @@ let policy = VerifyPolicy::new()
 ## Security notes
 - **A PID is not a stable identity.** The process may exit and its PID be reused between the time you get the PID and the time you verify it. On Windows, the executable *file on disk* is verified, not the image running in memory, so a file replaced after launch is not detected. Don't rely on `verify_pid` alone to authenticate a peer, such as the other end of a pipe.
 - **Files are verified by path.** Anyone who can write to the file can replace it between verifying it and using it, so only rely on verifying files in locations that untrusted users can't write to.
+
+## Changes in 1.1
+No API was removed or changed. Windows verification is roughly twice as fast on folders of signed files, and three behaviors changed:
+- **SHA-1 catalog lookups are off by default.** 1.0 searched the catalogs by SHA-1 hash after a SHA-256 miss; 1.1 only does so with `VerifyPolicy::new().sha1_catalogs(true)`. Files listed only in SHA-1 catalogs, mostly pre-2016 driver packages, are now `Unsigned` by default, as they were in 0.2.
+- **Non-PE files are looked up in the catalogs before their embedded signature is checked.** A file that is both catalog signed and carries an embedded signature now reports the catalog's signer.
+- **A verifier keeps its catalog lookup contexts** between calls. For a file listed in several catalogs this can change which catalog, and so which leaf certificate, is reported from one verifier to the next. The order was never specified, and every reported certificate is a trusted signer of that file.
 
 ## Migrating from 0.2
 In 1.0, `CodeSignVerifier` holds the verification policy and is built once and reused, rather than being created for each file. The file or PID now goes to the verify call:

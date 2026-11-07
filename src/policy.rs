@@ -23,6 +23,7 @@ pub enum Revocation {
 /// - revocation is not checked
 /// - network access is left to the platform (see [`VerifyPolicy::allow_network`])
 /// - a certificate that expired after the file was signed is still accepted
+/// - on Windows, catalogs are searched by SHA-256 hash only (see [`VerifyPolicy::sha1_catalogs`])
 /// - on macOS, the requirement is `anchor trusted` and every architecture of a universal
 ///   binary is validated
 ///
@@ -42,6 +43,8 @@ pub struct VerifyPolicy {
     pub(crate) revocation: Revocation,
     pub(crate) allow_network: Option<bool>,
     pub(crate) strict_expiration: bool,
+    #[cfg(any(windows, doc))]
+    pub(crate) sha1_catalogs: bool,
     #[cfg(any(target_os = "macos", doc))]
     pub(crate) requirement: String,
     #[cfg(any(target_os = "macos", doc))]
@@ -54,6 +57,8 @@ impl Default for VerifyPolicy {
             revocation: Revocation::None,
             allow_network: None,
             strict_expiration: false,
+            #[cfg(any(windows, doc))]
+            sha1_catalogs: false,
             #[cfg(any(target_os = "macos", doc))]
             requirement: "anchor trusted".to_string(),
             #[cfg(any(target_os = "macos", doc))]
@@ -96,6 +101,22 @@ impl VerifyPolicy {
         self
     }
 
+    /// Also search the system catalogs by SHA-1 hash when no catalog lists the file's SHA-256
+    /// hash. Off by default.
+    ///
+    /// Windows itself still accepts catalogs that list their members by SHA-1 hash only; they
+    /// come with driver packages signed before 2016 and are rare on current systems. A SHA-1
+    /// hash is weak enough that a crafted file could be made to match a legitimately listed
+    /// one, so the default does not trust such catalogs and reports their files as `Unsigned`.
+    /// Turn this on to match Windows' own verdict instead. It costs an extra hash and lookup
+    /// for every file that turns out to be unsigned.
+    #[cfg(any(windows, doc))]
+    #[cfg_attr(docsrs, doc(cfg(windows)))]
+    pub fn sha1_catalogs(mut self, enabled: bool) -> Self {
+        self.sha1_catalogs = enabled;
+        self
+    }
+
     /// Set the code requirement the signature must satisfy, written in Apple's
     /// [Code Signing Requirement Language](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/RequirementLang/RequirementLang.html).
     /// Defaults to `anchor trusted`. For example `anchor apple generic and certificate
@@ -132,6 +153,8 @@ mod tests {
         assert_eq!(policy.revocation, Revocation::None);
         assert_eq!(policy.allow_network, None);
         assert!(!policy.strict_expiration);
+        #[cfg(windows)]
+        assert!(!policy.sha1_catalogs);
         #[cfg(target_os = "macos")]
         {
             assert_eq!(policy.requirement, "anchor trusted");
