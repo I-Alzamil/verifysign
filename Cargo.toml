@@ -1,7 +1,7 @@
 [package]
 # Forked on 22 February 2025 from codesign-verify-rs by Vlad Krasnov <vlad@cloudflare.com>
 name = "verifysign"
-version = "1.0.1"
+version = "1.1.0"
 description = "Verify the digital code signature of files and running processes on Windows and macOS."
 authors = ["Vlad Krasnov <vlad@cloudflare.com>","I-Alzamil <easysekker@gmail.com>"]
 edition = "2024"
