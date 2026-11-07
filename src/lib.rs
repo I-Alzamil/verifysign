@@ -681,11 +681,10 @@ mod tests {
         for path in [explorer_path(), cmd_path()] {
             let ctx = signed_context(&path).unwrap();
 
-            assert_eq!(
-                ctx.sha1_thumbprint(),
-                windows_signer_property(&path, "Thumbprint").to_lowercase()
-            );
-            assert_eq!(ctx.sha256_thumbprint(), windows_sha256_thumbprint(&path));
+            let sha1s = expected_signer_values(&path, "Thumbprint");
+            assert!(sha1s.contains(&ctx.sha1_thumbprint()), "{path}: {} not among {sha1s:?}", ctx.sha1_thumbprint());
+            let sha256s = expected_signer_values(&path, "Sha256");
+            assert!(sha256s.contains(&ctx.sha256_thumbprint()), "{path}: {} not among {sha256s:?}", ctx.sha256_thumbprint());
         }
     }
 
@@ -715,10 +714,8 @@ mod tests {
         for path in [explorer_path(), cmd_path()] {
             let ctx = signed_context(&path).unwrap();
 
-            assert_eq!(
-                ctx.serial().unwrap_or_default(),
-                windows_signer_property(&path, "SerialNumber").to_lowercase()
-            );
+            let serials = expected_signer_values(&path, "SerialNumber");
+            assert!(serials.contains(&ctx.serial().unwrap_or_default()), "{path}: {:?} not among {serials:?}", ctx.serial());
         }
     }
 
@@ -900,6 +897,91 @@ mod tests {
         ))
     }
 
+    // A PowerShell expression for a certificate's `kind`: a property name such as
+    // "Thumbprint" or "SerialNumber", or "Sha256" for the SHA-256 hash of the encoded
+    // certificate, which .NET doesn't expose as a property.
+    #[cfg(windows)]
+    fn ps_cert_value(cert: &str, kind: &str) -> String {
+        match kind {
+            "Sha256" => format!(
+                "[System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash(({cert}).RawData)) -replace '-',''"
+            ),
+            property => format!("({cert}).{property}"),
+        }
+    }
+
+    // The certificates Windows could legitimately report as the signer of `path`, as
+    // lowercase values of `kind` (see `ps_cert_value`).
+    //
+    // A file with an embedded signature has exactly one signer, which .NET reads straight from
+    // the file. A catalog signed file may be listed in several catalogs, each signed with its
+    // own certificate, and Windows doesn't define which one a verifier reports (PowerShell's
+    // Get-AuthenticodeSignature prefers catalogs even over an embedded signature, and picks
+    // among them differently from WinTrust's enumeration order), so any of them is accepted.
+    #[cfg(windows)]
+    fn expected_signer_values(path: &str, kind: &str) -> Vec<String> {
+        // CreateFromSignedFile is a static of the base class, which PowerShell doesn't expose
+        // through X509Certificate2, so the certificate is created there and then upgraded.
+        let embedded = run_powershell(&format!(
+            "try {{ $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList \
+             ([System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile('{path}')); {} }} catch {{ 'none' }}",
+            ps_cert_value("$c", kind)
+        ));
+        if embedded != "none" {
+            assert!(!embedded.is_empty(), "{path}: empty {kind} from PowerShell");
+            return vec![embedded.to_lowercase()];
+        }
+
+        let catalogs = catalogs_listing(path);
+        assert!(!catalogs.is_empty(), "{path} has neither an embedded signature nor a catalog entry");
+        let list = catalogs.iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(",");
+        let output = run_powershell(&format!(
+            "foreach ($p in @({list})) {{ {} }}",
+            ps_cert_value("(Get-AuthenticodeSignature -FilePath $p).SignerCertificate", kind)
+        ));
+        let values: Vec<String> = output.lines().map(|l| l.trim().to_lowercase()).collect();
+        assert_eq!(values.len(), catalogs.len(), "PowerShell output: {output:?}");
+        values
+    }
+
+    // The system catalogs that list `path` by its SHA-256 hash, as full paths.
+    #[cfg(windows)]
+    fn catalogs_listing(path: &str) -> Vec<String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Security::Cryptography::BCRYPT_SHA256_ALGORITHM;
+        use windows_sys::Win32::Security::Cryptography::Catalog::{
+            CATALOG_INFO, CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
+            CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext,
+        };
+
+        let file = std::fs::File::open(path).unwrap();
+        let mut catalogs = Vec::new();
+        unsafe {
+            let mut admin: isize = 0;
+            assert_ne!(CryptCATAdminAcquireContext2(&mut admin, std::ptr::null(), BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0), 0);
+            let mut hash = [0u8; 64];
+            let mut hash_len = hash.len() as u32;
+            assert_ne!(CryptCATAdminCalcHashFromFileHandle2(admin, file.as_raw_handle() as _, &mut hash_len, hash.as_mut_ptr(), 0), 0);
+
+            // Passing the previous context continues the enumeration and releases it.
+            let mut prev: isize = 0;
+            loop {
+                let next = if prev == 0 { std::ptr::null_mut() } else { &mut prev as *mut isize };
+                prev = CryptCATAdminEnumCatalogFromHash(admin, hash.as_ptr(), hash_len, 0, next);
+                if prev == 0 {
+                    break;
+                }
+                let mut info: CATALOG_INFO = std::mem::zeroed();
+                info.cbStruct = std::mem::size_of::<CATALOG_INFO>() as u32;
+                assert_ne!(CryptCATCatalogInfoFromContext(prev, &mut info, 0), 0);
+                let end = info.wszCatalogFile.iter().position(|&c| c == 0).unwrap();
+                catalogs.push(String::from_utf16_lossy(&info.wszCatalogFile[..end]));
+            }
+            CryptCATAdminReleaseContext(admin, 0);
+        }
+        catalogs
+    }
+
     // Parses a `.SignerCertificate.Subject`/`.Issuer`-style distinguished name
     // (e.g. "CN=..., O=..., C=US") for the given RDN key, mirroring the macOS
     // `macos_cert_field` helper so fields are asked of the OS rather than hardcoded.
@@ -913,12 +995,4 @@ mod tests {
         })
     }
 
-    #[cfg(windows)]
-    fn windows_sha256_thumbprint(path: &str) -> String {
-        run_powershell(&format!(
-            "$c = (Get-AuthenticodeSignature -FilePath '{}').SignerCertificate; \
-             [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($c.RawData)) -replace '-',''",
-            path
-        )).to_lowercase()
-    }
 }
