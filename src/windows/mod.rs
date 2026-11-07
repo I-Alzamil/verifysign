@@ -92,16 +92,40 @@ impl FileHandle {
         self.0.as_raw_handle() as HANDLE
     }
 
-    /// Whether the file starts with the `MZ` magic of a PE image. Leaves the file position at
+    /// Whether the file is of a format that normally carries its own (embedded) signature,
+    /// judged by its header and, for text formats, its extension. Leaves the file position at
     /// the start of the file.
-    fn is_pe(&self) -> bool {
+    ///
+    /// Only the order of the two lookups depends on this, never the result: a file that is
+    /// signed either way is found either way. But the catalog lookup is serialized system
+    /// wide (it goes through the CryptSvc service), while WinTrust's embedded signature check
+    /// runs in parallel, so a scanner on many threads must not pay a catalog lookup for every
+    /// catalog, installer or script that turns out to carry its own signature.
+    fn usually_signed_embedded(&self, path: &std::path::Path) -> bool {
         use std::io::Read;
 
-        let mut magic = [0u8; 2];
-        let is_pe = (&self.0).read_exact(&mut magic).is_ok() && &magic == b"MZ";
+        let mut header = [0u8; 8];
+        let read = (&self.0).read(&mut header).unwrap_or(0);
         self.rewind();
+        let header = &header[..read];
 
-        is_pe
+        let by_header = header.starts_with(b"MZ")                                      // PE image
+            || header.starts_with(&[0x30, 0x82]) || header.starts_with(&[0x30, 0x83])   // DER: .cat, .p7x
+            || header.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1])    // OLE: .msi, .msp
+            || header.starts_with(b"MSCF");                                            // cabinet
+        if by_header {
+            return true;
+        }
+
+        // Signed text and package formats are recognised by their SIPs by extension.
+        const EXTENSIONS: [&str; 18] = [
+            "ps1", "psm1", "psd1", "ps1xml", "psc1", "cdxml", "mof",
+            "js", "jse", "vbs", "vbe", "wsf", "wsh",
+            "appx", "msix", "appxbundle", "msixbundle", "p7x",
+        ];
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| EXTENSIONS.iter().any(|known| e.eq_ignore_ascii_case(known)))
     }
 
     fn rewind(&self) {
@@ -160,9 +184,9 @@ impl Verifier {
             }
         };
 
-        if file.is_pe() {
-            // A PE file usually carries its signature, and finding out that it doesn't is
-            // cheap, so look there first.
+        if file.usually_signed_embedded(path) {
+            // Executables, catalogs, installers, cabinets and signed scripts normally carry
+            // their signature, so look there first.
             match unsafe { self.verify_embedded(&wide) } {
                 Ok(context) => return Ok(context),
                 // No embedded signature: it may still be signed through a system catalog.
@@ -175,9 +199,8 @@ impl Verifier {
 
         // For any other file type, finding out whether it can carry an embedded signature at
         // all takes WinTrust several milliseconds, while a catalog lookup takes about one, and
-        // most signed non-PE files (.inf, .xml, .mui, ...) are catalog signed. So the catalog
-        // comes first, and the embedded signature is only looked for when no catalog lists
-        // the file.
+        // signed data files (.inf, .xml, .mui, ...) are catalog signed. So the catalog comes
+        // first, and the embedded signature is only looked for when no catalog lists the file.
         let catalog_err = match self.verify_catalog_signed(path, &wide, file, false) {
             Ok(context) => return Ok(context),
             Err(Error::Unsigned) => None,
@@ -504,18 +527,28 @@ mod tests {
     }
 
     #[test]
-    fn test_pe_detection() {
-        let dir = std::env::temp_dir().join(format!("verifysign-pe-detection-{}", std::process::id()));
+    fn test_embedded_signature_format_detection() {
+        let dir = std::env::temp_dir().join(format!("verifysign-format-detection-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let check = |name: &str, content: &[u8]| {
             let path = dir.join(name);
             std::fs::write(&path, content).unwrap();
-            FileHandle::open(&path).unwrap().is_pe()
+            FileHandle::open(&path).unwrap().usually_signed_embedded(&path)
         };
 
+        // By header, whatever the extension says.
         assert!(check("exe.bin", b"MZ\x90\x00 rest of the image"));
+        assert!(check("catalog.bin", b"\x30\x82\x1a\x2b\x06\x09"));
+        assert!(check("installer.bin", b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1 ole"));
+        assert!(check("cabinet.bin", b"MSCF\0\0\0\0"));
+        // By extension, for text formats.
+        assert!(check("script.PS1", b"Write-Host hi"));
+        assert!(check("script.vbs", b"MsgBox 1"));
+        assert!(check("package.msix", b"PK\x03\x04"));
+        // Data files go to the catalogs first.
         assert!(!check("text.txt", b"the MZ magic is not at the start"));
+        assert!(!check("driver.inf", b"[Version]\r\nSignature=\"$WINDOWS NT$\""));
         assert!(!check("short.bin", b"M"));
         assert!(!check("empty.bin", b""));
 
