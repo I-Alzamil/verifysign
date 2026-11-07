@@ -122,7 +122,7 @@ let policy = VerifyPolicy::new()
 
 ## Platform behavior
 
-**Windows** uses `WinVerifyTrust` with `WINTRUST_ACTION_GENERIC_VERIFY_V2`. A PE file (`MZ` header) is checked for an embedded signature first and, if it has none, looked up in the system catalogs by SHA-256 hash (and by SHA-1 hash if the policy enables it). Any other file is looked up in the catalogs first, since most signed data files (such as `.inf`) are catalog signed and detecting an embedded signature on them is slow; the embedded signature is only checked when no catalog lists the file. When a file is listed in several catalogs, which one is reported is unspecified. A process is verified through the executable file it was started from.
+**Windows** uses `WinVerifyTrust` with `WINTRUST_ACTION_GENERIC_VERIFY_V2`. A PE file (`MZ` header) is checked for an embedded signature first and, if it has none, looked up in the system catalogs by SHA-256 hash (and by SHA-1 hash if the policy enables it). Any other file is looked up in the catalogs first, since most signed data files (such as `.inf`) are catalog signed and detecting an embedded signature on them is slow; the embedded signature is only checked when no catalog lists the file. When a file is listed in several catalogs, the first one Windows lists is used, the same one Windows' own tools report. A process is verified through the executable file it was started from.
 
 **macOS** uses the Security framework's code signing services and works with both binaries and application bundles. On Apple Silicon the linker gives every binary an ad-hoc signature, which carries no certificate; such binaries are reported as `Unsigned`.
 
@@ -142,10 +142,9 @@ let policy = VerifyPolicy::new()
 - **Files are verified by path.** Anyone who can write to the file can replace it between verifying it and using it, so only rely on verifying files in locations that untrusted users can't write to.
 
 ## Changes in 1.1
-No API was removed or changed. Windows verification is roughly twice as fast on folders of signed files, and three behaviors changed:
+No API was removed or changed. Windows verification is faster on folders of signed files (about 20% on System32, about twice as fast on catalog-signed data files such as `Windows\INF`), and two behaviors changed:
 - **SHA-1 catalog lookups are off by default.** 1.0 searched the catalogs by SHA-1 hash after a SHA-256 miss; 1.1 only does so with `VerifyPolicy::new().sha1_catalogs(true)`. Files listed only in SHA-1 catalogs, mostly pre-2016 driver packages, are now `Unsigned` by default, as they were in 0.2.
 - **Non-PE files are looked up in the catalogs before their embedded signature is checked.** A file that is both catalog signed and carries an embedded signature now reports the catalog's signer.
-- **A verifier keeps its catalog lookup contexts** between calls. For a file listed in several catalogs this can change which catalog, and so which leaf certificate, is reported from one verifier to the next. The order was never specified, and every reported certificate is a trusted signer of that file.
 
 ## Migrating from 0.2
 In 1.0, `CodeSignVerifier` holds the verification policy and is built once and reused, rather than being created for each file. The file or PID now goes to the verify call:

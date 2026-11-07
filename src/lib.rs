@@ -509,15 +509,42 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn test_reported_certificate_independent_of_history() {
+        // A file listed in several catalogs must report the same certificate whether the
+        // verifier has verified other files before it or not: a catalog lookup context lists
+        // the catalogs it already opened first, so contexts must not be carried over between
+        // files. Windows' own tools (and test_thumbprints) see the fresh-context order.
+        let system32 = format!("{}\\System32", std::env::var("windir").unwrap());
+        let mut files: Vec<_> = std::fs::read_dir(&system32)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        files.sort();
+        files.truncate(60);
+        files.push(std::path::PathBuf::from(cmd_path()));
+
+        let busy = CodeSignVerifier::default();
+        let busy_results: Vec<_> = files.iter().map(|f| busy.verify_file(f).ok().map(|c| c.sha256_thumbprint())).collect();
+
+        for (file, busy_result) in files.iter().zip(busy_results) {
+            let fresh = CodeSignVerifier::default().verify_file(file).ok().map(|c| c.sha256_thumbprint());
+            assert_eq!(busy_result, fresh, "{}", file.display());
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn test_context_outlives_verifier() {
-        // A catalog verification borrows a lookup context and the open file from the verifier.
-        // The results must stay readable after the verifier, and other results, are gone.
-        let verifier = CodeSignVerifier::default();
+        // A catalog verification keeps its lookup context and the open file alive inside the
+        // result. The results must stay readable after the verifier, and other results, are gone.
         let inf = format!("{}\\INF\\machine.inf", std::env::var("windir").unwrap());
-        let first = verifier.verify_file(cmd_path()).unwrap();
-        let second = verifier.verify_file(&inf).unwrap();
-        drop(verifier);
-        drop(first);
+        let second = {
+            let verifier = CodeSignVerifier::default();
+            let _first = verifier.verify_file(cmd_path()).unwrap();
+            verifier.verify_file(&inf).unwrap()
+        };
 
         assert_eq!(second.subject_name().organization.as_deref(), Some("Microsoft Corporation"));
         assert_eq!(second.sha256_thumbprint().len(), 64);

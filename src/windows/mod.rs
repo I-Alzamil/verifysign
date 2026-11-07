@@ -1,8 +1,6 @@
 mod context;
 mod win;
 
-use std::sync::{Arc, Mutex, PoisonError};
-
 use super::{Error, Revocation, VerifyPolicy};
 use context::close_data;
 use win::*;
@@ -10,7 +8,6 @@ use win::*;
 #[derive(Debug, Clone)]
 pub(crate) struct Verifier {
     policy: VerifyPolicy,
-    catalog_admins: Arc<CatalogAdmins>,
 }
 pub(crate) use context::Context;
 
@@ -36,75 +33,38 @@ impl CatalogHash {
     }
 }
 
-/// Catalog administrator contexts (`HCATADMIN`) kept for the verifier's lifetime.
+/// A catalog administrator context (`HCATADMIN`), released on drop.
 ///
-/// Acquiring a context is cheap, but a context that has already looked files up has the
-/// catalog database warm, which makes the next lookup several times faster. A context is used
-/// by one verification at a time, so a verifier shared between threads holds up to one per
-/// concurrent verification.
-#[derive(Debug, Default)]
-struct CatalogAdmins {
-    sha256: Mutex<Vec<isize>>,
-    sha1: Mutex<Vec<isize>>,
-}
-
-impl CatalogAdmins {
-    fn pool(&self, hash: CatalogHash) -> &Mutex<Vec<isize>> {
-        match hash {
-            CatalogHash::Sha256 => &self.sha256,
-            CatalogHash::Sha1 => &self.sha1,
-        }
-    }
-
-    /// Takes an idle context from the pool, or acquires a new one.
-    fn acquire(self: &Arc<Self>, hash: CatalogHash) -> Result<CatalogAdmin, Error> {
-        let pooled = self.pool(hash).lock().unwrap_or_else(PoisonError::into_inner).pop();
-
-        let handle = match pooled {
-            Some(handle) => handle,
-            None => {
-                let mut handle: isize = 0;
-                let result = unsafe { CryptCATAdminAcquireContext2(
-                    &mut handle,
-                    std::ptr::null(),
-                    hash.algorithm(),
-                    std::ptr::null(),
-                    0,
-                ) };
-                if result == 0 {
-                    return Err(Error::OsError(last_error()));
-                }
-                handle
-            }
-        };
-
-        Ok(CatalogAdmin { admins: Arc::clone(self), hash, handle })
-    }
-}
-
-impl Drop for CatalogAdmins {
-    fn drop(&mut self) {
-        for pool in [&self.sha256, &self.sha1] {
-            for handle in pool.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
-                unsafe { CryptCATAdminReleaseContext(handle, 0) };
-            }
-        }
-    }
-}
-
-/// A catalog administrator context borrowed from a [`CatalogAdmins`] pool, returned on drop.
-///
-/// It keeps the pool alive, so a context referenced by open WinTrust state data is neither
-/// released nor used by another verification until that state is closed.
+/// Each verification acquires its own. Reusing a context across files would make lookups
+/// faster, but a context lists the catalogs it has already opened first, so the catalog (and
+/// thus the certificate) reported for a file listed in several would depend on what was
+/// verified before it. A fresh context returns the catalogs in database order, the same order
+/// Windows' own tools use.
 pub(super) struct CatalogAdmin {
-    admins: Arc<CatalogAdmins>,
-    hash: CatalogHash,
     handle: isize,
+}
+
+impl CatalogAdmin {
+    fn acquire(hash: CatalogHash) -> Result<Self, Error> {
+        let mut handle: isize = 0;
+        let result = unsafe { CryptCATAdminAcquireContext2(
+            &mut handle,
+            std::ptr::null(),
+            hash.algorithm(),
+            std::ptr::null(),
+            0,
+        ) };
+        if result == 0 {
+            return Err(Error::OsError(last_error()));
+        }
+
+        Ok(CatalogAdmin { handle })
+    }
 }
 
 impl Drop for CatalogAdmin {
     fn drop(&mut self) {
-        self.admins.pool(self.hash).lock().unwrap_or_else(PoisonError::into_inner).push(self.handle);
+        unsafe { CryptCATAdminReleaseContext(self.handle, 0) };
     }
 }
 
@@ -177,7 +137,7 @@ pub(super) struct CatalogResources {
 impl Verifier {
     // Every policy is valid on Windows; this is fallible only to match the macOS backend.
     pub fn new(policy: VerifyPolicy) -> Result<Self, Error> {
-        Ok(Self { policy, catalog_admins: Arc::default() })
+        Ok(Self { policy })
     }
 
     pub fn policy(&self) -> &VerifyPolicy {
@@ -275,7 +235,7 @@ impl Verifier {
     /// Verifies `file` (opened from `path`, null terminated) against each catalog containing
     /// its `hash`, returning `Error::Unsigned` if no catalog contains it.
     fn verify_catalog_signed_with(&self, path: &[u16], file: FileHandle, hash: CatalogHash) -> Result<Context, Error> {
-        let admin = self.catalog_admins.acquire(hash)?;
+        let admin = CatalogAdmin::acquire(hash)?;
 
         // Large enough for any supported digest; the call sets hash_size to the actual length.
         let mut hash_buffer = [0u8; 64];
@@ -541,36 +501,6 @@ mod tests {
         let policy = VerifyPolicy::new().strict_expiration(true);
 
         assert_ne!(trust_flags(&policy).1 & WTD_LIFETIME_SIGNING_FLAG, 0);
-    }
-
-    #[test]
-    fn test_catalog_admin_pool_reuses_contexts() {
-        let admins: Arc<CatalogAdmins> = Arc::default();
-        let pool_len = |hash| admins.pool(hash).lock().unwrap().len();
-
-        // Nothing is acquired until it is needed, and a returned context is kept for reuse.
-        assert_eq!(pool_len(CatalogHash::Sha256), 0);
-        let first = admins.acquire(CatalogHash::Sha256).unwrap();
-        let handle = first.handle;
-        assert_ne!(handle, 0);
-        drop(first);
-        assert_eq!(pool_len(CatalogHash::Sha256), 1);
-
-        let second = admins.acquire(CatalogHash::Sha256).unwrap();
-        assert_eq!(second.handle, handle);
-        assert_eq!(pool_len(CatalogHash::Sha256), 0);
-
-        // A concurrent borrower gets its own context; both go back to the pool.
-        let third = admins.acquire(CatalogHash::Sha256).unwrap();
-        assert_ne!(third.handle, handle);
-        drop((second, third));
-        assert_eq!(pool_len(CatalogHash::Sha256), 2);
-
-        // The pools are per algorithm.
-        let sha1 = admins.acquire(CatalogHash::Sha1).unwrap();
-        assert_eq!(pool_len(CatalogHash::Sha256), 2);
-        drop(sha1);
-        assert_eq!(pool_len(CatalogHash::Sha1), 1);
     }
 
     #[test]
